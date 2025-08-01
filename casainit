@@ -2123,10 +2123,6 @@ EOF
         fi
         
         return 0
-    else
-        __print_err "Failed to install Continue extension"
-        return 1
-    fi
 }
 
 # Create model cache script
