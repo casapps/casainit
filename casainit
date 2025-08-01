@@ -1,0 +1,3324 @@
+#!/bin/sh
+# CasAInit - Fully self-contained, POSIX-compliant shell bootstrapper for Arch Linux
+# https://github.com/casapps/casainit
+# MIT License
+
+set -u
+
+# Script metadata
+SCRIPT_VERSION="1.0.0"
+SCRIPT_REPO_URL="https://github.com/casapps/casainit"
+SCRIPT_NAME="casainit"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Global variables
+RAW_MODE=false
+HOME_DIR="${HOME:-/home/$USER}"
+CONFIG_DIR="$HOME_DIR/.config/casainit"
+BIN_DIR="$HOME_DIR/.local/bin"
+SHARE_DIR="$HOME_DIR/.local/share/casainit"
+LOG_DIR="$HOME_DIR/.local/log/casainit"
+CACHE_DIR="$HOME_DIR/.cache/casainit"
+MODELS_DIR="/var/lib/casainit/models"
+ENV_FILE="$CONFIG_DIR/settings.env"
+MODELS_TOML="$CONFIG_DIR/models.toml"
+MCP_TOML="$CONFIG_DIR/mcp.toml"
+
+# Color definitions
+COLOR_RESET="\033[0m"
+COLOR_RED="\033[31m"
+COLOR_GREEN="\033[32m"
+COLOR_YELLOW="\033[33m"
+COLOR_BLUE="\033[34m"
+COLOR_MAGENTA="\033[35m"
+COLOR_CYAN="\033[36m"
+COLOR_BOLD="\033[1m"
+
+# Icon definitions
+ICON_SUCCESS="✅"
+ICON_ERROR="❌"
+ICON_WARN="⚠️"
+ICON_INFO="💡"
+ICON_PACKAGE="📦"
+ICON_PROGRESS="⏳"
+ICON_DOWNLOAD="⬇️"
+ICON_INSTALL="🔧"
+
+# Core printf functions
+__printf_reset_color() {
+    printf '%b' "$COLOR_RESET"
+}
+
+__printf_reset_nc() {
+    printf ''  # No color reset needed in raw mode
+}
+
+__printf_newline_color() {
+    printf '%b\n' "$COLOR_RESET"
+}
+
+__printf_newline_nc() {
+    printf '\n'
+}
+
+__printf_log_raw() {
+    printf '%s\n' "$1"
+}
+
+# Print with color (no newline)
+__printf_color() {
+    color="$1"
+    shift
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s' "$@"
+    else
+        printf '%b%s' "$color" "$@"
+        __printf_reset_color
+    fi
+}
+
+# Progress bar functions
+__printf_percent_color() {
+    percent="$1"
+    task="$2"
+    width="${3:-50}"
+    
+    # Calculate filled and empty portions
+    filled=$((percent * width / 100))
+    empty=$((width - filled))
+    
+    # Create progress bar
+    printf '\r%b[' "$COLOR_CYAN"
+    printf '%*s' "$filled" | tr ' ' '='
+    printf '%*s' "$empty" | tr ' ' '>'
+    printf '] %3d%% %s%b' "$percent" "$task" "$COLOR_RESET"
+}
+
+__printf_percent_nc() {
+    percent="$1"
+    task="$2"
+    printf '\r[%3d%%] %s' "$percent" "$task"
+}
+
+# Wrapper function that chooses color or no-color version
+__print_progress() {
+    if [ "$RAW_MODE" = "true" ]; then
+        __printf_percent_nc "$@"
+    else
+        __printf_percent_color "$@"
+    fi
+}
+
+# Complete a progress display
+__print_progress_done() {
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '\n'
+    else
+        printf '\n'
+    fi
+}
+
+# Smart progress monitoring for different commands
+__monitor_progress() {
+    command_type="$1"
+    shift
+    
+    case "$command_type" in
+        docker_pull)
+            # Monitor docker pull progress
+            image="$1"
+            docker pull "$image" 2>&1 | while IFS= read -r line; do
+                case "$line" in
+                    *"Pulling from"*)
+                        __print_info "Pulling image: $image"
+                        ;;
+                    *"Downloading"*)
+                        # Extract percentage from Docker output
+                        if echo "$line" | grep -q '\[.*=.*>\.*\]'; then
+                            percent=$(echo "$line" | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p')
+                            if [ -n "$percent" ]; then
+                                __print_progress "$percent" "Downloading layers"
+                            fi
+                        fi
+                        ;;
+                    *"Download complete"*|*"Pull complete"*)
+                        __print_progress 100 "Download complete"
+                        __print_progress_done
+                        ;;
+                esac
+            done
+            ;;
+            
+        curl_download)
+            # Monitor curl download with progress
+            url="$1"
+            output="$2"
+            
+            if [ "$RAW_MODE" = "true" ]; then
+                curl -L --progress-bar "$url" -o "$output" 2>&1 | \
+                    sed -u 's/.*\[\([0-9]*\)%\].*/\1/' | \
+                    while read -r percent; do
+                        [ -n "$percent" ] && __print_progress "$percent" "Downloading"
+                    done
+            else
+                curl -L --progress-bar "$url" -o "$output" 2>&1 | \
+                    grep -o '[0-9]*\.[0-9]%' | \
+                    sed 's/%//' | \
+                    while read -r percent; do
+                        __print_progress "${percent%.*}" "Downloading"
+                    done
+            fi
+            __print_progress_done
+            ;;
+            
+        ollama_pull)
+            # Monitor ollama model pull
+            model="$1"
+            ollama pull "$model" 2>&1 | while IFS= read -r line; do
+                case "$line" in
+                    *"pulling"*)
+                        # Extract percentage if available
+                        percent=$(echo "$line" | grep -o '[0-9]\+%' | sed 's/%//')
+                        if [ -n "$percent" ]; then
+                            __print_progress "$percent" "Pulling $model"
+                        else
+                            __print_info "$line"
+                        fi
+                        ;;
+                    *"success"*)
+                        __print_progress 100 "Model downloaded"
+                        __print_progress_done
+                        ;;
+                    *)
+                        # Show other messages as info
+                        [ -n "$line" ] && __print_info "$line"
+                        ;;
+                esac
+            done
+            ;;
+            
+        apt_install)
+            # Monitor apt installation progress
+            packages="$*"
+            
+            if __is_root; then
+                apt-get install -y $packages 2>&1 | while IFS= read -r line; do
+                    case "$line" in
+                        *"Reading package lists"*)
+                            __print_progress 10 "Reading package lists"
+                            ;;
+                        *"Building dependency tree"*)
+                            __print_progress 20 "Building dependency tree"
+                            ;;
+                        *"Downloading"*|*"Get:"*)
+                            __print_progress 50 "Downloading packages"
+                            ;;
+                        *"Unpacking"*)
+                            __print_progress 70 "Unpacking packages"
+                            ;;
+                        *"Setting up"*)
+                            __print_progress 90 "Configuring packages"
+                            ;;
+                        *"Processing triggers"*)
+                            __print_progress 95 "Processing triggers"
+                            ;;
+                    esac
+                done
+            else
+                sudo apt-get install -y $packages
+            fi
+            __print_progress 100 "Installation complete"
+            __print_progress_done
+            ;;
+            
+        yay_install)
+            # Monitor yay AUR installation
+            packages="$*"
+            yay -S --noconfirm $packages 2>&1 | while IFS= read -r line; do
+                case "$line" in
+                    *"Cloning"*)
+                        __print_progress 20 "Cloning AUR repository"
+                        ;;
+                    *"Building"*)
+                        __print_progress 40 "Building package"
+                        ;;
+                    *"Installing"*)
+                        __print_progress 80 "Installing package"
+                        ;;
+                    *"checking dependencies"*)
+                        __print_progress 30 "Checking dependencies"
+                        ;;
+                esac
+            done
+            __print_progress 100 "Installation complete"
+            __print_progress_done
+            ;;
+            
+        pacman_install)
+            # Monitor pacman installation  
+            packages="$*"
+            total=$(echo "$packages" | wc -w)
+            current=0
+            
+            for pkg in $packages; do
+                current=$((current + 1))
+                percent=$((current * 100 / total))
+                
+                if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+                    __print_progress "$percent" "Installing $pkg"
+                    if __is_root; then
+                        pacman -S --noconfirm "$pkg" >/dev/null 2>&1
+                    else
+                        __sudo_run pacman -S --noconfirm "$pkg" >/dev/null 2>&1
+                    fi
+                fi
+            done
+            __print_progress 100 "Package installation complete"
+            __print_progress_done
+            ;;
+            
+        git_clone)
+            # Monitor git clone progress
+            url="$1"
+            dest="${2:-.}"
+            
+            # Git clone with progress parsing
+            git clone --progress "$url" "$dest" 2>&1 | while IFS= read -r line; do
+                case "$line" in
+                    *"Receiving objects:"*)
+                        # Extract percentage from git output
+                        percent=$(echo "$line" | sed -n 's/.*Receiving objects: *\([0-9]*\)%.*/\1/p')
+                        if [ -n "$percent" ]; then
+                            __print_progress "$percent" "Cloning repository"
+                        fi
+                        ;;
+                    *"Resolving deltas:"*)
+                        percent=$(echo "$line" | sed -n 's/.*Resolving deltas: *\([0-9]*\)%.*/\1/p')
+                        if [ -n "$percent" ]; then
+                            __print_progress "$percent" "Resolving deltas"
+                        fi
+                        ;;
+                esac
+            done
+            __print_progress_done
+            ;;
+            
+        make_build)
+            # Monitor make build with file counting
+            target="${1:-all}"
+            
+            # Count source files for progress estimation
+            total_files=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.cc" 2>/dev/null | wc -l)
+            if [ "$total_files" -eq 0 ]; then
+                total_files=10  # Fallback
+            fi
+            
+            make "$target" 2>&1 | while IFS= read -r line; do
+                case "$line" in
+                    *"CC "*|*"CXX "*|*"gcc "*|*"g++ "*)
+                        compiled=$((compiled + 1))
+                        percent=$((compiled * 100 / total_files))
+                        [ "$percent" -gt 100 ] && percent=99
+                        __print_progress "$percent" "Building"
+                        ;;
+                esac
+            done
+            __print_progress 100 "Build complete"
+            __print_progress_done
+            ;;
+            
+        systemctl_action)
+            # Monitor systemctl operations
+            action="$1"
+            service="$2"
+            
+            __print_progress 10 "Sending $action signal"
+            if __is_root; then
+                systemctl "$action" "$service" >/dev/null 2>&1
+            else
+                __sudo_run systemctl "$action" "$service" >/dev/null 2>&1
+            fi
+            
+            __print_progress 50 "Waiting for service"
+            sleep 1
+            
+            # Check service status
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                __print_progress 100 "Service $action complete"
+            else
+                __print_progress 100 "Service $action processed"
+            fi
+            __print_progress_done
+            ;;
+            
+        download_extract)
+            # Combined download and extract with progress
+            url="$1"
+            dest="$2"
+            extract_dir="${3:-.}"
+            
+            # Download phase
+            __monitor_progress curl_download "$url" "$dest" || return 1
+            
+            # Extract phase
+            __print_progress 0 "Extracting archive"
+            case "$dest" in
+                *.tar.gz|*.tgz)
+                    tar -xzf "$dest" -C "$extract_dir" 2>&1 | while read -r line; do
+                        __print_progress 50 "Extracting files"
+                    done
+                    ;;
+                *.tar.xz)
+                    tar -xJf "$dest" -C "$extract_dir" 2>&1 | while read -r line; do
+                        __print_progress 50 "Extracting files"
+                    done
+                    ;;
+                *.zip)
+                    unzip -q "$dest" -d "$extract_dir" 2>&1 | while read -r line; do
+                        __print_progress 50 "Extracting files"
+                    done
+                    ;;
+            esac
+            __print_progress 100 "Extraction complete"
+            __print_progress_done
+            ;;
+            
+        generic)
+            # Generic progress for long-running tasks
+            task_name="$1"
+            total_steps="${2:-100}"
+            current_step=0
+            
+            while [ "$current_step" -lt "$total_steps" ]; do
+                percent=$((current_step * 100 / total_steps))
+                __print_progress "$percent" "$task_name"
+                current_step=$((current_step + 1))
+                sleep 0.1
+            done
+            __print_progress 100 "$task_name"
+            __print_progress_done
+            ;;
+    esac
+}
+
+# Simple progress simulator for tasks without real progress
+__show_spinner() {
+    task="$1"
+    pid="$2"
+    
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s... ' "$task"
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+        done
+        printf 'done\n'
+    else
+        # Use emoji spinner if available
+        spinner_frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        # Fallback to ASCII if emojis not supported
+        if [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+            spinner_frames='|/-\'
+        fi
+        
+        i=0
+        frame_count=${#spinner_frames}
+        
+        printf '%b%s  %s ' "$COLOR_CYAN" "$ICON_PROGRESS" "$task"
+        while kill -0 "$pid" 2>/dev/null; do
+            # Get current frame
+            frame=$(printf '%s' "$spinner_frames" | cut -c$((i+1)))
+            printf '\b%s' "$frame"
+            
+            # Update counter
+            i=$(( (i+1) % frame_count ))
+            sleep 0.1
+        done
+        
+        # Clear spinner and show completion
+        printf '\b%b%s  %s%b\n' "$COLOR_GREEN" "$ICON_SUCCESS" "done" "$COLOR_RESET"
+    fi
+}
+
+# Alternative spinner with custom icons
+__show_spinner_custom() {
+    task="$1"
+    pid="$2"
+    icon="${3:-$ICON_PROGRESS}"
+    
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '[%s]  %s... ' "$icon" "$task"
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+        done
+        printf 'done\n'
+    else
+        printf '%b%s  %s ' "$COLOR_CYAN" "$icon" "$task"
+        
+        # Animated dots
+        dots=""
+        while kill -0 "$pid" 2>/dev/null; do
+            case "$dots" in
+                "")    dots="."    ;;
+                ".")   dots=".."   ;;
+                "..")  dots="..."  ;;
+                "...") dots=""     ;;
+            esac
+            printf '\r%b%s  %s%s   %b' "$COLOR_CYAN" "$icon" "$task" "$dots" "$COLOR_RESET"
+            sleep 0.3
+        done
+        
+        printf '\r%b%s  %s%b\n' "$COLOR_GREEN" "$ICON_SUCCESS" "$task" "$COLOR_RESET"
+    fi
+}
+
+# Print with color and newline
+__printf_color_line() {
+    color="$1"
+    shift
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s\n' "$@"
+    else
+        printf '%b%s' "$color" "$@"
+        __printf_newline_color
+    fi
+}
+
+# Print header with separator
+__print_header() {
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s\n' "$1"
+        printf '%s\n' "$(printf '%.0s-' $(seq 1 ${#1}))"
+    else
+        printf '%b━━━ %s ━━━%b\n' "$COLOR_BOLD" "$1" "$COLOR_RESET"
+    fi
+}
+
+# Print status line with alignment
+__print_status() {
+    label="$1"
+    status="$2"
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%-20s %s\n' "$label:" "$status"
+    else
+        printf '%b%-20s%b %s\n' "$COLOR_BOLD" "$label:" "$COLOR_RESET" "$status"
+    fi
+}
+
+# Print functions using the core functions
+__print() {
+    if [ "$RAW_MODE" = "true" ]; then
+        __printf_log_raw "$1"
+    else
+        __printf_log_raw "$1"
+    fi
+}
+
+__print_info() {
+    if [ "$RAW_MODE" = "true" ]; then
+        __printf_log_raw "$1"
+    else
+        printf '%b%s  %s' "$COLOR_CYAN" "$ICON_INFO" "$1"
+        __printf_newline_color
+    fi
+}
+
+__print_success() {
+    if [ "$RAW_MODE" = "true" ]; then
+        __printf_log_raw "$1"
+    else
+        printf '%b%s  %s' "$COLOR_GREEN" "$ICON_SUCCESS" "$1"
+        __printf_newline_color
+    fi
+}
+
+__print_warn() {
+    if [ "$RAW_MODE" = "true" ]; then
+        __printf_log_raw "Warning: $1"
+    else
+        printf '%b%s  %s' "$COLOR_YELLOW" "$ICON_WARN" "$1"
+        __printf_newline_color
+    fi
+}
+
+__print_err() {
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s\n' "Error: $1" >&2
+    else
+        printf '%b%s  %s' "$COLOR_RED" "$ICON_ERROR" "$1" >&2
+        __printf_newline_color >&2
+    fi
+}
+
+# Print check result (✓ or ✗)
+__print_check() {
+    status="$1"
+    message="$2"
+    
+    if [ "$RAW_MODE" = "true" ]; then
+        if [ "$status" = "ok" ]; then
+            printf '[OK] %s\n' "$message"
+        else
+            printf '[FAIL] %s\n' "$message"
+        fi
+    else
+        if [ "$status" = "ok" ]; then
+            printf '%b✓%b %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$message"
+        else
+            printf '%b✗%b %s\n' "$COLOR_RED" "$COLOR_RESET" "$message"
+        fi
+    fi
+}
+
+__print_raw() {
+    __printf_log_raw "$1"
+}
+
+__print_prompt() {
+    # For interactive prompts like "Domain name for your Jitsi Meet instance"
+    if [ "$RAW_MODE" = "true" ]; then
+        printf '%s ' "$1"
+    else
+        printf '%b❯%b %s ' "$COLOR_MAGENTA" "$COLOR_RESET" "$1"
+    fi
+}
+
+__die() {
+    __print_err "$1"
+    exit 1
+}
+
+# Let's Encrypt certificate handling
+__check_letsencrypt_cert() {
+    # Use literal path /etc/letsencrypt/live/domain
+    cert_path="/etc/letsencrypt/live/domain"
+    
+    if [ ! -d "$cert_path" ]; then
+        __print_check "fail" "Let's Encrypt certificate not found"
+        __print_info "Certificate path expected: $cert_path"
+        return 1
+    fi
+    
+    # Check all required files
+    cert_file="$cert_path/fullchain.pem"
+    key_file="$cert_path/privkey.pem"
+    chain_file="$cert_path/chain.pem"
+    
+    # Check if files exist
+    for file in "$cert_file" "$key_file" "$chain_file"; do
+        if [ ! -f "$file" ]; then
+            __print_check "fail" "Missing certificate file: $file"
+            return 1
+        fi
+    done
+    
+    __print_check "ok" "Let's Encrypt certificate files found"
+    
+    # Check if certificate and key match
+    cert_modulus=$(openssl x509 -noout -modulus -in "$cert_file" 2>/dev/null | openssl md5)
+    key_modulus=$(openssl rsa -noout -modulus -in "$key_file" 2>/dev/null | openssl md5)
+    
+    if [ "$cert_modulus" = "$key_modulus" ]; then
+        __print_check "ok" "SSL certificate and private key match"
+    else
+        # This is a warning, not a hard failure
+        __print_check "fail" "SSL certificate and private key do not match!"
+        __print_warn "Certificate mismatch detected - this may cause connection issues"
+        __print_info "You may need to renew your Let's Encrypt certificate"
+    fi
+    
+    # Check certificate expiration
+    expiry_date=$(openssl x509 -noout -enddate -in "$cert_file" 2>/dev/null | cut -d= -f2)
+    if [ -n "$expiry_date" ]; then
+        __print_info "Certificate expires: $expiry_date"
+        
+        # Check if certificate is expired
+        expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" +%s 2>/dev/null)
+        current_epoch=$(date +%s)
+        
+        if [ -n "$expiry_epoch" ] && [ "$current_epoch" -gt "$expiry_epoch" ]; then
+            __print_check "fail" "Certificate has expired!"
+            __print_warn "Please renew your Let's Encrypt certificate with: certbot renew"
+        elif [ -n "$expiry_epoch" ]; then
+            days_left=$(( (expiry_epoch - current_epoch) / 86400 ))
+            if [ "$days_left" -lt 30 ]; then
+                __print_warn "Certificate expires in $days_left days - consider renewal"
+            else
+                __print_check "ok" "Certificate valid for $days_left more days"
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
+# Setup Let's Encrypt certificates for a service
+__setup_letsencrypt_cert() {
+    service_name="$1"
+    
+    __print_info "Setting up Let's Encrypt certificate for $service_name"
+    
+    # Check if certificate exists  
+    if ! __check_letsencrypt_cert; then
+        __print_warn "Let's Encrypt certificate not found"
+        __print_info "To obtain a certificate, run:"
+        __print_raw "  sudo certbot certonly --standalone -d yourdomain.com"
+        return 1
+    fi
+    
+    # Create symlinks or copy certificates as needed
+    cert_path="/etc/letsencrypt/live/domain"
+    service_cert_dir="$CONFIG_DIR/$service_name/certs"
+    
+    __ensure_dir "$service_cert_dir"
+    
+    # Some services need certificates in specific locations
+    __print_info "Configuring certificates for $service_name"
+    
+    return 0
+}
+
+# Check if command exists
+__command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Create directory if it doesn't exist
+__ensure_dir() {
+    if [ ! -d "$1" ]; then
+        # Try to create as user first
+        if mkdir -p "$1" 2>/dev/null; then
+            return 0
+        fi
+        
+        # If that failed, try with sudo
+        __sudo_run mkdir -p "$1" || __die "Failed to create directory: $1"
+    fi
+}
+
+# Detect if running as root
+__is_root() {
+    [ "$(id -u)" -eq 0 ]
+}
+
+# Test if user can sudo (cached for performance)
+__can_sudo() {
+    # If already root, no need for sudo
+    if __is_root; then
+        return 0
+    fi
+    
+    # Cache the result to avoid multiple password prompts
+    if [ -z "${_CAN_SUDO_CACHED:-}" ]; then
+        if __command_exists sudo && sudo -n true 2>/dev/null; then
+            _CAN_SUDO_CACHED="yes"
+        else
+            # Try with password prompt once
+            if __command_exists sudo && sudo -v 2>/dev/null; then
+                _CAN_SUDO_CACHED="yes"
+            else
+                _CAN_SUDO_CACHED="no"
+            fi
+        fi
+    fi
+    
+    [ "$_CAN_SUDO_CACHED" = "yes" ]
+}
+
+# Run command with sudo if needed and possible
+__sudo_run() {
+    if __is_root; then
+        # Already root, run directly
+        "$@"
+    elif __can_sudo; then
+        # Can sudo, use it
+        sudo "$@"
+    else
+        # Cannot sudo, fail
+        __print_err "This operation requires sudo access"
+        __print_info "Please run with: sudo $SCRIPT_NAME"
+        return 1
+    fi
+}
+
+# Set directory permissions with sudo if needed
+__set_permissions() {
+    path="$1"
+    perms="$2"
+    
+    if chmod "$perms" "$path" 2>/dev/null; then
+        return 0
+    fi
+    
+    __sudo_run chmod "$perms" "$path"
+}
+
+# Get real user when running with sudo
+__get_real_user() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        printf '%s' "$SUDO_USER"
+    else
+        id -un
+    fi
+}
+
+# Check if system is Arch Linux
+__check_arch() {
+    if [ ! -f "/etc/arch-release" ]; then
+        __die "This script is designed for Arch Linux only"
+    fi
+}
+
+# Parse command line arguments
+parse_args() {
+    # Default command is install (non-interactive)
+    COMMAND="install"
+    SUBCOMMAND=""
+    SERVICE_NAME=""
+    TYPE_FILTER=""
+    INTERACTIVE=false
+    FORCE_YES=true  # Default to non-interactive
+    REMOVE_DATA=false
+    
+    # Check for flags first
+    for arg in "$@"; do
+        case "$arg" in
+            --raw)
+                RAW_MODE=true
+                ;;
+            --interactive|-i)
+                INTERACTIVE=true
+                FORCE_YES=false
+                ;;
+            --yes|-y)
+                FORCE_YES=true
+                ;;
+            --remove-data)
+                REMOVE_DATA=true
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            --version|-v)
+                __print "CasAInit version $SCRIPT_VERSION"
+                exit 0
+                ;;
+        esac
+    done
+    
+    # If no command specified, default is install/update
+    has_command=false
+    for arg in "$@"; do
+        case "$arg" in
+            install|uninstall|update|fix|gpu|status|service|models)
+                has_command=true
+                break
+                ;;
+        esac
+    done
+    
+    # If no command given, use smart default
+    if [ "$has_command" = "false" ] && [ $# -gt 0 ]; then
+        # Check if first arg looks like a flag
+        case "$1" in
+            --*)
+                # Keep default install command
+                ;;
+            *)
+                # Assume first arg is a command
+                has_command=true
+                ;;
+        esac
+    fi
+    
+    # Parse positional arguments
+    for arg in "$@"; do
+        case "$arg" in
+            --raw|--interactive|-i|--yes|-y|--help|-h|--version|-v)
+                # Skip flags already processed
+                ;;
+            install|uninstall|update|fix|gpu|status)
+                COMMAND="$arg"
+                ;;
+            service)
+                COMMAND="$arg"
+                ;;
+            models)
+                COMMAND="$arg"
+                ;;
+            start|stop|restart|status)
+                if [ "$COMMAND" = "service" ]; then
+                    SUBCOMMAND="$arg"
+                fi
+                ;;
+            remote|installed|refresh|cache)
+                if [ "$COMMAND" = "models" ]; then
+                    SUBCOMMAND="$arg"
+                fi
+                ;;
+            --type=*)
+                TYPE_FILTER="${arg#--type=}"
+                ;;
+            *)
+                if [ "$COMMAND" = "service" ] && [ -n "$SUBCOMMAND" ]; then
+                    # This is the service name after the action
+                    SERVICE_NAME="$arg"
+                elif [ "$COMMAND" = "service" ] && [ -z "$SUBCOMMAND" ]; then
+                    # First arg after service command
+                    SUBCOMMAND="$arg"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Show help message
+show_help() {
+    cat << EOF
+CasAInit - Local AI Stack Bootstrapper for Arch Linux
+
+Usage: casainit [command] [options]
+
+DEFAULT BEHAVIOR:
+  When run without arguments, performs non-interactive install/update
+
+Commands:
+  install              Install/update all AI tools and models (default)
+  uninstall            Uninstall all AI tools
+  update               Update all installed tools (alias for install)
+  service [action]     Manage services (start|stop|restart|status)
+  models [action]      Manage models (remote|installed|refresh|install)
+  fix                  Repair installation and permissions
+  gpu                  Show GPU information
+  status               Show installation status
+
+Options:
+  --interactive, -i    Run in interactive mode (prompt for options)
+  --yes, -y            Assume yes to all prompts (default)
+  --remove-data        Remove all models and configurations during uninstall
+  --raw                Disable colors and emojis (for scripting)
+  --help, -h           Show this help message
+  --version, -v        Show version information
+  --type=TYPE          Filter by type (ollama,tts,diffusion)
+
+Examples:
+  casainit                           # Non-interactive install/update
+  curl -sL $SCRIPT_REPO_URL/casainit | sh     # One-line install
+  casainit --interactive             # Interactive installation
+  casainit uninstall                 # Uninstall CasAInit (keeps models)
+  casainit uninstall --remove-data   # Uninstall and remove all data
+  casainit service start             # Start all services
+  casainit service restart ollama    # Restart specific service
+  casainit models remote             # List available models
+  casainit status                    # Show current status
+
+Repository: $SCRIPT_REPO_URL
+License: MIT
+EOF
+}
+
+# Initialize environment
+__init_env() {
+    __ensure_dir "$CONFIG_DIR"
+    __ensure_dir "$BIN_DIR"
+    __ensure_dir "$SHARE_DIR"
+    __ensure_dir "$LOG_DIR"
+    __ensure_dir "$CACHE_DIR"
+}
+
+# Hardware detection functions
+__detect_cpu_cores() {
+    if __command_exists nproc; then
+        nproc
+    else
+        grep -c ^processor /proc/cpuinfo 2>/dev/null || printf '1'
+    fi
+}
+
+__detect_ram_gb() {
+    if [ -f /proc/meminfo ]; then
+        # Get total memory in KB from /proc/meminfo
+        mem_kb=$(grep '^MemTotal:' /proc/meminfo | awk '{print $2}')
+        # Convert to GB using awk for floating point
+        printf '%s' "$mem_kb" | awk '{printf "%.0f", $1/1024/1024}'
+    else
+        printf '0'
+    fi
+}
+
+__detect_gpu_type() {
+    # Check for NVIDIA GPU
+    if __command_exists nvidia-smi; then
+        printf 'nvidia'
+        return 0
+    fi
+    
+    # Check for AMD GPU
+    if __command_exists rocm-smi || lspci 2>/dev/null | grep -iq 'amd.*vga\|amd.*display'; then
+        printf 'amd'
+        return 0
+    fi
+    
+    # Check for Intel GPU
+    if lspci 2>/dev/null | grep -iq 'intel.*vga\|intel.*display'; then
+        printf 'intel'
+        return 0
+    fi
+    
+    # No GPU detected
+    printf 'none'
+}
+
+__detect_vram_gb() {
+    gpu_type=$(__detect_gpu_type)
+    
+    case "$gpu_type" in
+        nvidia)
+            if __command_exists nvidia-smi; then
+                # Parse VRAM from nvidia-smi
+                vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1)
+                if [ -n "$vram_mb" ]; then
+                    printf '%s' "$vram_mb" | awk '{printf "%.0f", $1/1024}'
+                else
+                    printf '0'
+                fi
+            else
+                printf '0'
+            fi
+            ;;
+        amd)
+            if __command_exists rocm-smi; then
+                # Parse VRAM from rocm-smi (this is approximate, actual parsing may vary)
+                vram_info=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -i total | head -n1)
+                if [ -n "$vram_info" ]; then
+                    # Extract number and convert to GB
+                    printf '%s' "$vram_info" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+/) print int($i/1024)}'
+                else
+                    printf '0'
+                fi
+            else
+                printf '0'
+            fi
+            ;;
+        *)
+            printf '0'
+            ;;
+    esac
+}
+
+__detect_arch() {
+    uname -m
+}
+
+__get_system_score() {
+    cpu_cores=$(__detect_cpu_cores)
+    ram_gb=$(__detect_ram_gb)
+    vram_gb=$(__detect_vram_gb)
+    
+    # Calculate score: (CPU cores * 0.5) + RAM + VRAM
+    printf '%s %s %s' "$cpu_cores" "$ram_gb" "$vram_gb" | \
+        awk '{printf "%.1f", ($1 * 0.5) + $2 + $3}'
+}
+
+__detect_free_disk_gb() {
+    target_dir="${1:-/var/lib}"
+    
+    # Ensure the parent directory exists for checking
+    if [ ! -d "$target_dir" ]; then
+        target_dir="/"
+    fi
+    
+    # Get available space in KB and convert to GB
+    available_kb=$(df "$target_dir" 2>/dev/null | tail -n1 | awk '{print $4}')
+    if [ -n "$available_kb" ]; then
+        printf '%s' "$available_kb" | awk '{printf "%.0f", $1/1024/1024}'
+    else
+        printf '0'
+    fi
+}
+
+# Environment file management
+__env_init() {
+    if [ ! -f "$ENV_FILE" ]; then
+        __print_info "Creating initial environment file..."
+        __env_create
+    fi
+}
+
+__env_create() {
+    # Detect current system specs
+    cpu_cores=$(__detect_cpu_cores)
+    ram_gb=$(__detect_ram_gb)
+    vram_gb=$(__detect_vram_gb)
+    gpu_type=$(__detect_gpu_type)
+    arch=$(__detect_arch)
+    user_name=$(__get_real_user)
+    
+    # Create environment file with proper formatting
+    cat > "$ENV_FILE" << EOF
+#────────────────────────────────────────────────────────#
+# ⚠️  AUTO-GENERATED CASAICLI ENV FILE — DO NOT EDIT
+#────────────────────────────────────────────────────────#
+
+#────────────────────────────────────────────────────────#
+# 📜 SCRIPT METADATA
+#────────────────────────────────────────────────────────#
+SCRIPT_VERSION="$SCRIPT_VERSION"
+SCRIPT_REPO_URL="$SCRIPT_REPO_URL"
+
+#────────────────────────────────────────────────────────#
+# 🧮 SYSTEM HARDWARE SPECS
+#────────────────────────────────────────────────────────#
+SYSTEM_CPU_CORES="$cpu_cores"
+SYSTEM_RAM_GB="$ram_gb"
+SYSTEM_VRAM_GB="$vram_gb"
+SYSTEM_GPU_TYPE="$gpu_type"
+SYSTEM_ARCH="$arch"
+
+#────────────────────────────────────────────────────────#
+# 💻 MAIN COMMAND IMPLEMENTATIONS
+#────────────────────────────────────────────────────────#
+INSTALLED_ollama="no"
+INSTALLED_piper="no"
+INSTALLED_opencode="no"
+INSTALLED_openwebui="no"
+INSTALLED_opendiffusion="no"
+INSTALLED_continue="no"
+
+#────────────────────────────────────────────────────────#
+# 🔌 ENABLED SERVICES (containers only)
+#────────────────────────────────────────────────────────#
+ENABLED_openwebui="no"
+ENABLED_opendiffusion="no"
+
+#────────────────────────────────────────────────────────#
+# 🧠 MCP SERVICE TRACKING
+#────────────────────────────────────────────────────────#
+
+#────────────────────────────────────────────────────────#
+# 🔐 PERMISSION & ELEVATION FLAGS
+#────────────────────────────────────────────────────────#
+REQUIRES_ROOT="no"
+USER_NAME="$user_name"
+USER_GROUP="users"
+
+#────────────────────────────────────────────────────────#
+# 📁 PATHS
+#────────────────────────────────────────────────────────#
+MODELS_PATH="$MODELS_DIR"
+LOG_PATH="$LOG_DIR"
+CONFIG_PATH="$CONFIG_DIR"
+BIN_PATH="$BIN_DIR"
+
+#────────────────────────────────────────────────────────#
+# 📆 TIMING
+#────────────────────────────────────────────────────────#
+LAST_CACHE_RUN=""
+LAST_SCRIPT_UPDATE="$(date -u +%Y-%m-%dT%H:%MZ)"
+
+#────────────────────────────────────────────────────────#
+# 🌐 PORT ASSIGNMENTS
+#────────────────────────────────────────────────────────#
+PORT_ollama="11434"
+PORT_openwebui="3000"
+PORT_opendiffusion="7860"
+PORT_continue="8123"
+
+#────────────────────────────────────────────────────────#
+# 💾 MODEL DIRECTORIES
+#────────────────────────────────────────────────────────#
+MODELDIR_ollama="/var/lib/casainit/models/ollama"
+MODELDIR_tts="/var/lib/casainit/models/tts"
+MODELDIR_diffusion="/var/lib/casainit/models/diffusion"
+EOF
+}
+
+__env_load() {
+    if [ -f "$ENV_FILE" ]; then
+        # Source the environment file
+        . "$ENV_FILE"
+    else
+        __die "Environment file not found: $ENV_FILE"
+    fi
+}
+
+__env_set() {
+    key="$1"
+    value="$2"
+    
+    if [ ! -f "$ENV_FILE" ]; then
+        __env_create
+    fi
+    
+    # Check if key exists
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        # Update existing key
+        temp_file="${ENV_FILE}.tmp"
+        awk -v key="$key" -v value="$value" '
+            BEGIN { FS="="; OFS="=" }
+            $1 == key { print $1, "\"" value "\""; next }
+            { print }
+        ' "$ENV_FILE" > "$temp_file"
+        mv "$temp_file" "$ENV_FILE"
+    else
+        # Add new key at the end
+        printf '%s="%s"\n' "$key" "$value" >> "$ENV_FILE"
+    fi
+}
+
+__env_get() {
+    key="$1"
+    default="${2:-}"
+    
+    if [ -f "$ENV_FILE" ]; then
+        value=$(grep "^${key}=" "$ENV_FILE" | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+        if [ -n "$value" ]; then
+            printf '%s' "$value"
+        else
+            printf '%s' "$default"
+        fi
+    else
+        printf '%s' "$default"
+    fi
+}
+
+# GitHub API functions
+__gh_get_release_url() {
+    repo="$1"  # e.g., "ollama/ollama"
+    filter="${2:-}"  # Optional filter pattern
+    
+    # Get latest release info from GitHub API
+    api_url="https://api.github.com/repos/$repo/releases/latest"
+    
+    # Fetch release data
+    release_data=$(curl -sL "$api_url" 2>/dev/null)
+    
+    if [ -z "$release_data" ]; then
+        __print_err "Failed to fetch release data from GitHub"
+        return 1
+    fi
+    
+    # Get system architecture
+    sys_arch=$(__detect_arch)
+    arch_pattern=""
+    
+    case "$sys_arch" in
+        x86_64)
+            arch_pattern="x86_64\|amd64\|x64"
+            ;;
+        aarch64|arm64)
+            arch_pattern="arm64\|aarch64"
+            ;;
+        *)
+            __print_err "Unsupported architecture: $sys_arch"
+            return 1
+            ;;
+    esac
+    
+    # Parse download URL based on architecture
+    download_url=$(printf '%s' "$release_data" | \
+        grep -o '"browser_download_url": *"[^"]*"' | \
+        cut -d'"' -f4 | \
+        grep -i "linux" | \
+        grep -E "$arch_pattern" | \
+        grep -v "sha256\|sig\|asc" | \
+        head -n1)
+    
+    if [ -z "$download_url" ]; then
+        __print_err "No suitable download found for $sys_arch"
+        return 1
+    fi
+    
+    printf '%s' "$download_url"
+}
+
+__download_file() {
+    url="$1"
+    dest="$2"
+    
+    # Create destination directory
+    dest_dir=$(dirname "$dest")
+    __ensure_dir "$dest_dir"
+    
+    __print_info "Downloading from: $url"
+    
+    if __command_exists curl; then
+        __monitor_progress curl_download "$url" "$dest" || return 1
+    elif __command_exists wget; then
+        wget -q -O "$dest" "$url" || return 1
+    else
+        __print_err "Neither curl nor wget available"
+        return 1
+    fi
+    
+    return 0
+}
+
+__extract_archive() {
+    archive="$1"
+    dest_dir="$2"
+    
+    __ensure_dir "$dest_dir"
+    
+    case "$archive" in
+        *.tar.gz|*.tgz)
+            tar -xzf "$archive" -C "$dest_dir" || return 1
+            ;;
+        *.tar.bz2)
+            tar -xjf "$archive" -C "$dest_dir" || return 1
+            ;;
+        *.tar.xz)
+            tar -xJf "$archive" -C "$dest_dir" || return 1
+            ;;
+        *.zip)
+            if __command_exists unzip; then
+                unzip -q "$archive" -d "$dest_dir" || return 1
+            else
+                __print_err "unzip not available"
+                return 1
+            fi
+            ;;
+        *)
+            __print_err "Unknown archive format: $archive"
+            return 1
+            ;;
+    esac
+    
+    return 0
+}
+
+# Tool installation functions
+__install_ollama() {
+    __print_info "Installing Ollama..."
+    
+    # Check if already installed
+    if [ "$(__env_get INSTALLED_ollama)" = "yes" ] && __command_exists ollama; then
+        __print_info "Ollama already installed"
+        return 0
+    fi
+    
+    # Get download URL from GitHub
+    download_url=$(__gh_get_release_url "ollama/ollama")
+    if [ -z "$download_url" ]; then
+        __print_err "Failed to get Ollama download URL"
+        return 1
+    fi
+    
+    # Download to temp file
+    temp_file="/tmp/ollama-$$.tar.gz"
+    if ! __download_file "$download_url" "$temp_file"; then
+        __print_err "Failed to download Ollama"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # Extract to share directory
+    ollama_dir="$SHARE_DIR/ollama"
+    __ensure_dir "$ollama_dir"
+    
+    if ! __extract_archive "$temp_file" "$ollama_dir"; then
+        __print_err "Failed to extract Ollama"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # Find and symlink binary
+    ollama_bin=$(find "$ollama_dir" -name "ollama" -type f -executable | head -n1)
+    if [ -z "$ollama_bin" ]; then
+        __print_err "Ollama binary not found in archive"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    ln -sf "$ollama_bin" "$BIN_DIR/ollama"
+    chmod +x "$BIN_DIR/ollama"
+    
+    # Clean up temp file
+    rm -f "$temp_file"
+    
+    # Create systemd service
+    __create_ollama_service
+    
+    # Update environment
+    __env_set "INSTALLED_ollama" "yes"
+    __env_set "VERSION_ollama" "$(__get_ollama_version)"
+    
+    __print_success "Ollama installed successfully"
+    return 0
+}
+
+__get_ollama_version() {
+    if __command_exists ollama; then
+        ollama --version 2>/dev/null | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n1
+    else
+        printf 'unknown'
+    fi
+}
+
+__create_ollama_service() {
+    real_user=$(__get_real_user)
+    service_file="$HOME_DIR/.config/systemd/user/casainit-ollama.service"
+    
+    __ensure_dir "$(dirname "$service_file")"
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=CasAInit Ollama Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BIN_DIR/ollama serve --models $MODELS_DIR/ollama
+Restart=always
+RestartSec=3
+Environment="HOME=$HOME_DIR"
+Environment="PATH=$BIN_DIR:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target
+EOF
+    
+    # Enable and start service
+    if __command_exists systemctl; then
+        systemctl --user daemon-reload
+        systemctl --user enable casainit-ollama.service
+        systemctl --user start casainit-ollama.service
+    fi
+}
+
+# Package management functions
+__install_prerequisites() {
+    __print_info "Installing prerequisites..."
+    
+    # Check if running as root or can sudo
+    can_sudo=false
+    if __is_root; then
+        can_sudo=true
+    elif __command_exists sudo && sudo -n true 2>/dev/null; then
+        can_sudo=true
+    fi
+    
+    if [ "$can_sudo" = "false" ]; then
+        __print_err "Need root or sudo access to install prerequisites"
+        __print_info "Please run: sudo $0 $*"
+        return 1
+    fi
+    
+    # Update package database
+    __print_info "Updating package database..."
+    if __is_root; then
+        pacman -Sy --noconfirm >/dev/null 2>&1 || return 1
+    else
+        __sudo_run pacman -Sy --noconfirm >/dev/null 2>&1 || return 1
+    fi
+    
+    # Required packages from pacman
+    pacman_packages="bash curl wget jq awk sed grep findutils coreutils pciutils usbutils procps-ng systemd docker base-devel git"
+    
+    __print_info "Installing required packages..."
+    __monitor_progress pacman_install $pacman_packages || return 1
+    
+    # Install yay if not present
+    if ! __command_exists yay; then
+        __print_info "Installing yay AUR helper..."
+        __install_yay || return 1
+    fi
+    
+    # Install VS Code from AUR
+    if ! pacman -Q visual-studio-code-bin >/dev/null 2>&1; then
+        __print_info "Installing Visual Studio Code..."
+        yay -S --noconfirm visual-studio-code-bin || return 1
+    fi
+    
+    # Add user to docker group
+    real_user=$(__get_real_user)
+    if ! groups "$real_user" 2>/dev/null | grep -q docker; then
+        __print_info "Adding $real_user to docker group..."
+        if __is_root; then
+            usermod -aG docker "$real_user" || return 1
+        else
+            sudo usermod -aG docker "$real_user" || return 1
+        fi
+        __print_warn "You need to log out and back in for docker group changes to take effect"
+    fi
+    
+    # Start and enable docker
+    if __command_exists systemctl; then
+        if ! systemctl is-active docker >/dev/null 2>&1; then
+            __print_info "Starting Docker service..."
+            if __is_root; then
+                systemctl start docker || return 1
+                systemctl enable docker || return 1
+            else
+                sudo systemctl start docker || return 1
+                sudo systemctl enable docker || return 1
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
+__install_yay() {
+    temp_dir="/tmp/yay-install-$$"
+    mkdir -p "$temp_dir" || return 1
+    cd "$temp_dir" || return 1
+    
+    # Clone yay repository
+    __monitor_progress git_clone "https://aur.archlinux.org/yay.git" "yay" || {
+        cd - >/dev/null
+        rm -rf "$temp_dir"
+        return 1
+    }
+    
+    cd yay || return 1
+    
+    # Build and install
+    if __is_root; then
+        # If running as root, we need to build as a regular user
+        real_user=$(__get_real_user)
+        chown -R "$real_user:users" .
+        su - "$real_user" -c "cd $temp_dir/yay && makepkg -si --noconfirm" || {
+            cd - >/dev/null
+            rm -rf "$temp_dir"
+            return 1
+        }
+    else
+        makepkg -si --noconfirm || {
+            cd - >/dev/null
+            rm -rf "$temp_dir"
+            return 1
+        }
+    fi
+    
+    cd - >/dev/null
+    rm -rf "$temp_dir"
+    return 0
+}
+
+# Main entry point
+main() {
+    # Check if running on Arch Linux
+    __check_arch
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Check for root warning
+    if __is_root; then
+        __print_warn "Running as root may cause issues with some tools"
+    fi
+    
+    # Initialize directories
+    __init_env
+    
+    # Execute command
+    case "$COMMAND" in
+        install)
+            cmd_install
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        update)
+            # Update is an alias for install
+            cmd_install
+            ;;
+        service)
+            cmd_service "$SUBCOMMAND" "$SERVICE_NAME"
+            ;;
+        models)
+            cmd_models "$SUBCOMMAND"
+            ;;
+        fix)
+            cmd_fix
+            ;;
+        gpu)
+            cmd_gpu
+            ;;
+        status)
+            cmd_status
+            ;;
+        *)
+            __print_err "Unknown command: $COMMAND"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Model management functions
+__get_model_tier() {
+    score="$1"
+    
+    # Use awk for floating point comparison
+    tier=$(printf '%s' "$score" | awk '{
+        if ($1 >= 48) print "1"
+        else if ($1 >= 32) print "2"
+        else print "3"
+    }')
+    
+    printf '%s' "$tier"
+}
+
+__check_model_disk_space() {
+    model_size_gb="$1"
+    free_disk_gb=$(__detect_free_disk_gb)
+    
+    # Check if model size is > 60% of free disk
+    result=$(printf '%s %s' "$model_size_gb" "$free_disk_gb" | awk '{
+        if ($1 > ($2 * 0.6)) print "warn"
+        else print "ok"
+    }')
+    
+    printf '%s' "$result"
+}
+
+__test_bandwidth() {
+    __print_info "Testing download bandwidth..."
+    
+    # Test URLs in order
+    test_urls="https://speed.hetzner.de/10MB.bin https://speedtest.tele2.net/10MB.zip https://speedtest-sgp1.digitalocean.com/10mb.test"
+    
+    for url in $test_urls; do
+        start_time=$(date +%s)
+        
+        if curl -sL -m 30 -o /dev/null "$url" 2>/dev/null; then
+            end_time=$(date +%s)
+            duration=$((end_time - start_time))
+            
+            if [ "$duration" -gt 0 ]; then
+                # Calculate MB/s (10MB file)
+                bandwidth=$(printf '10 %s' "$duration" | awk '{printf "%.1f", $1/$2}')
+                printf '%s' "$bandwidth"
+                return 0
+            fi
+        fi
+    done
+    
+    # Fallback to 5 MB/s
+    printf '5.0'
+}
+
+__estimate_download_time() {
+    size_bytes="$1"
+    bandwidth_mbs="${2:-5.0}"
+    
+    # Convert bytes to MB and calculate time
+    time_seconds=$(printf '%s %s' "$size_bytes" "$bandwidth_mbs" | awk '{
+        mb = $1 / 1024 / 1024
+        seconds = mb / $2
+        printf "%.0f", seconds
+    }')
+    
+    # Format time
+    if [ "$time_seconds" -lt 60 ]; then
+        printf '%s seconds' "$time_seconds"
+    elif [ "$time_seconds" -lt 3600 ]; then
+        minutes=$(printf '%s' "$time_seconds" | awk '{printf "%.0f", $1/60}')
+        printf '%s minutes' "$minutes"
+    else
+        hours=$(printf '%s' "$time_seconds" | awk '{printf "%.1f", $1/3600}')
+        printf '%s hours' "$hours"
+    fi
+}
+
+__load_models_toml() {
+    if [ ! -f "$MODELS_TOML" ]; then
+        __print_warn "Models cache not found. Run 'casainit models refresh' to update."
+        return 1
+    fi
+    
+    # This would parse the TOML file - for now, return sample data
+    return 0
+}
+
+__select_default_models() {
+    system_score=$(__get_system_score)
+    system_tier=$(__get_model_tier "$system_score")
+    gpu_type=$(__detect_gpu_type)
+    vram_gb=$(__detect_vram_gb)
+    
+    __print_info "System score: $system_score (Tier $system_tier)"
+    
+    # Select models based on tier
+    case "$system_tier" in
+        1)
+            ollama_model="codellama:13b"
+            tts_model="en-us-libritts-high"
+            diffusion_model="dreamshaper-v7"
+            ;;
+        2)
+            ollama_model="mistral:7b"
+            tts_model="en-us-amy-high"
+            diffusion_model="deliberate-v2"
+            ;;
+        3)
+            ollama_model="llama2:7b"
+            tts_model="en-us-amy-low"
+            diffusion_model="dreamlike-diffusion-1.0"
+            ;;
+    esac
+    
+    # Check GPU requirements
+    if [ "$gpu_type" = "none" ] || [ "$vram_gb" -lt 4 ]; then
+        __print_warn "Limited GPU detected. Some models may run slowly."
+    fi
+    
+    # Set selected models in environment
+    __env_set "DEFAULT_OLLAMA_MODEL" "$ollama_model"
+    __env_set "DEFAULT_TTS_MODEL" "$tts_model"
+    __env_set "DEFAULT_DIFFUSION_MODEL" "$diffusion_model"
+    
+    __print_info "Selected models:"
+    __print_raw "  Ollama:    $ollama_model"
+    __print_raw "  TTS:       $tts_model"
+    __print_raw "  Diffusion: $diffusion_model"
+}
+
+__install_ollama_model() {
+    model_name="${1:-$DEFAULT_OLLAMA_MODEL}"
+    
+    if [ -z "$model_name" ]; then
+        model_name="llama2:7b"  # Fallback
+    fi
+    
+    __print_info "Installing Ollama model: $model_name"
+    
+    if __command_exists ollama; then
+        # Pull the model with progress monitoring
+        __monitor_progress ollama_pull "$model_name" || {
+            __print_err "Failed to pull model: $model_name"
+            return 1
+        }
+        
+        __print_success "Model installed: $model_name"
+        return 0
+    else
+        __print_err "Ollama not installed"
+        return 1
+    fi
+}
+
+__install_piper() {
+    __print_info "Installing Piper TTS..."
+    
+    # Check if already installed
+    if [ "$(__env_get INSTALLED_piper)" = "yes" ] && __command_exists piper; then
+        __print_info "Piper already installed"
+        return 0
+    fi
+    
+    # Get download URL from GitHub
+    download_url=$(__gh_get_release_url "rhasspy/piper")
+    if [ -z "$download_url" ]; then
+        __print_err "Failed to get Piper download URL"
+        return 1
+    fi
+    
+    # Download to temp file
+    temp_file="/tmp/piper-$$.tar.gz"
+    if ! __download_file "$download_url" "$temp_file"; then
+        __print_err "Failed to download Piper"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # Extract to share directory
+    piper_dir="$SHARE_DIR/piper"
+    __ensure_dir "$piper_dir"
+    
+    if ! __extract_archive "$temp_file" "$piper_dir"; then
+        __print_err "Failed to extract Piper"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # Find and symlink binary
+    piper_bin=$(find "$piper_dir" -name "piper" -type f -executable | head -n1)
+    if [ -z "$piper_bin" ]; then
+        __print_err "Piper binary not found in archive"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    ln -sf "$piper_bin" "$BIN_DIR/piper"
+    chmod +x "$BIN_DIR/piper"
+    
+    # Clean up temp file
+    rm -f "$temp_file"
+    
+    # Download a default voice model
+    __print_info "Downloading default TTS voice..."
+    __ensure_dir "$MODELS_DIR/tts"
+    
+    # Download en_US-amy-medium voice
+    voice_url="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx"
+    voice_json_url="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+    
+    __print_info "Downloading default voice model..."
+    if ! __monitor_progress curl_download "$voice_url" "$MODELS_DIR/tts/en_US-amy-medium.onnx"; then
+        __print_warn "Failed to download default voice model"
+    else
+        __monitor_progress curl_download "$voice_json_url" "$MODELS_DIR/tts/en_US-amy-medium.onnx.json"
+        __print_success "Default voice model installed"
+    fi
+    
+    # Update environment
+    __env_set "INSTALLED_piper" "yes"
+    __env_set "VERSION_piper" "$(__get_piper_version)"
+    
+    __print_success "Piper TTS installed successfully"
+    return 0
+}
+
+__get_piper_version() {
+    if __command_exists piper; then
+        piper --version 2>/dev/null | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n1
+    else
+        printf 'unknown'
+    fi
+}
+
+__install_openwebui() {
+    __print_info "Installing OpenWebUI..."
+    
+    # Check if already installed
+    if [ "$(__env_get INSTALLED_openwebui)" = "yes" ]; then
+        real_user=$(__get_real_user)
+        container_name="openwebui-${real_user}"
+        
+        if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^${container_name}$"; then
+            __print_info "OpenWebUI already installed and running"
+            return 0
+        fi
+    fi
+    
+    # Check Docker
+    if ! __command_exists docker; then
+        __print_err "Docker is required for OpenWebUI"
+        return 1
+    fi
+    
+    # Ensure directories exist
+    __ensure_dir "$CONFIG_DIR/openwebui"
+    
+    # Pull and start container
+    __print_info "Pulling OpenWebUI image..."
+    __monitor_progress docker_pull "ghcr.io/open-webui/open-webui:latest" || {
+        __print_err "Failed to pull OpenWebUI image"
+        return 1
+    }
+    
+    # Get port
+    port=$(__env_get "PORT_openwebui" "3000")
+    
+    # Check if port is in use
+    if nc -z localhost "$port" 2>/dev/null; then
+        __print_warn "Port $port is in use, finding alternative..."
+        # Find free port in range 64000-64999
+        for p in $(seq 64000 64999); do
+            if ! nc -z localhost "$p" 2>/dev/null; then
+                port="$p"
+                break
+            fi
+        done
+        __env_set "PORT_openwebui" "$port"
+    fi
+    
+    # Start container
+    real_user=$(__get_real_user)
+    container_name="openwebui-${real_user}"
+    
+    __print_info "Starting OpenWebUI container on port $port..."
+    docker run -d \
+        --name "$container_name" \
+        --restart always \
+        -p "${port}:8080" \
+        -v "$MODELS_DIR:/models" \
+        -v "$CONFIG_DIR/openwebui:/app/backend/data" \
+        ghcr.io/open-webui/open-webui:latest || {
+            __print_err "Failed to start OpenWebUI container"
+            return 1
+        }
+    
+    # Update environment
+    __env_set "INSTALLED_openwebui" "yes"
+    __env_set "ENABLED_openwebui" "yes"
+    
+    __print_success "OpenWebUI installed and running at http://localhost:$port"
+    return 0
+}
+
+__install_opendiffusion() {
+    __print_info "Installing OpenDiffusion..."
+    
+    # Check if already installed
+    if [ "$(__env_get INSTALLED_opendiffusion)" = "yes" ]; then
+        real_user=$(__get_real_user)
+        container_name="opendiffusion-${real_user}"
+        
+        if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^${container_name}$"; then
+            __print_info "OpenDiffusion already installed and running"
+            return 0
+        fi
+    fi
+    
+    # Check Docker
+    if ! __command_exists docker; then
+        __print_err "Docker is required for OpenDiffusion"
+        return 1
+    fi
+    
+    # Ensure directories exist
+    __ensure_dir "$CONFIG_DIR/opendiffusion"
+    __ensure_dir "$MODELS_DIR/diffusion"
+    
+    # Detect GPU
+    gpu_flags=""
+    if [ "$(__detect_gpu_type)" = "nvidia" ]; then
+        gpu_flags="--gpus all"
+        __print_info "NVIDIA GPU detected, enabling GPU acceleration"
+    fi
+    
+    # Pull and start container
+    __print_info "Pulling OpenDiffusion image..."
+    __monitor_progress docker_pull "stabilityai/stable-diffusion-webui:latest" || {
+        __print_err "Failed to pull OpenDiffusion image"
+        return 1
+    }
+    
+    # Get port
+    port=$(__env_get "PORT_opendiffusion" "7860")
+    
+    # Check if port is in use
+    if nc -z localhost "$port" 2>/dev/null; then
+        __print_warn "Port $port is in use, finding alternative..."
+        # Find free port in range 64000-64999
+        for p in $(seq 64000 64999); do
+            if ! nc -z localhost "$p" 2>/dev/null; then
+                port="$p"
+                break
+            fi
+        done
+        __env_set "PORT_opendiffusion" "$port"
+    fi
+    
+    # Start container
+    real_user=$(__get_real_user)
+    container_name="opendiffusion-${real_user}"
+    
+    __print_info "Starting OpenDiffusion container on port $port..."
+    docker run -d \
+        --name "$container_name" \
+        --restart always \
+        $gpu_flags \
+        -p "${port}:7860" \
+        -v "$MODELS_DIR/diffusion:/models" \
+        -v "$CONFIG_DIR/opendiffusion:/data" \
+        stabilityai/stable-diffusion-webui:latest || {
+            __print_err "Failed to start OpenDiffusion container"
+            return 1
+        }
+    
+    # Update environment
+    __env_set "INSTALLED_opendiffusion" "yes"
+    __env_set "ENABLED_opendiffusion" "yes"
+    
+    __print_success "OpenDiffusion installed and running at http://localhost:$port"
+    return 0
+}
+
+__install_continue() {
+    __print_info "Installing Continue VS Code extension..."
+    
+    # Check if VS Code is installed
+    if ! __command_exists code; then
+        __print_err "Visual Studio Code is not installed or not in PATH"
+        __print_info "Please ensure VS Code is installed and 'code' command is available"
+        return 1
+    fi
+    
+    # Check if already installed
+    if code --list-extensions 2>/dev/null | grep -q "continue.continue"; then
+        __print_info "Continue extension already installed"
+        __env_set "INSTALLED_continue" "yes"
+        return 0
+    fi
+    
+    # Install the extension
+    __print_info "Installing Continue extension..."
+    if code --install-extension continue.continue; then
+        __print_success "Continue extension installed"
+        __env_set "INSTALLED_continue" "yes"
+        
+        # Create config directory
+        __ensure_dir "$CONFIG_DIR/continue"
+        
+        # Create basic config
+        config_file="$HOME/.continue/config.json"
+        if [ ! -f "$config_file" ]; then
+            __print_info "Creating Continue configuration..."
+            __ensure_dir "$HOME/.continue"
+            
+            # Get Ollama port
+            ollama_port=$(__env_get "PORT_ollama" "11434")
+            
+            cat > "$config_file" << EOF
+{
+  "models": [
+    {
+      "title": "Ollama",
+      "provider": "ollama",
+      "model": "codellama:13b",
+      "apiBase": "http://localhost:$ollama_port"
+    }
+  ],
+  "tabAutocompleteModel": {
+    "title": "Ollama Autocomplete",
+    "provider": "ollama",
+    "model": "codellama:7b-code",
+    "apiBase": "http://localhost:$ollama_port"
+  }
+}
+EOF
+            __print_success "Continue configuration created"
+        fi
+        
+        return 0
+    else
+        __print_err "Failed to install Continue extension"
+        return 1
+    fi
+}
+
+# Create model cache script
+__create_model_cache_script() {
+    cat << 'CACHE_SCRIPT_EOF'
+#!/bin/sh
+# CasAInit Model Cache Update Script
+# Auto-generated by casainit.sh
+
+# Determine config directory
+if [ -n "$XDG_CONFIG_HOME" ]; then
+    CONFIG_DIR="$XDG_CONFIG_HOME/casainit"
+else
+    CONFIG_DIR="$HOME/.config/casainit"
+fi
+
+MODELS_TOML="$CONFIG_DIR/models.toml"
+BANDWIDTH_CACHE="$CONFIG_DIR/.bandwidth_test"
+
+# Ensure directory exists
+mkdir -p "$CONFIG_DIR"
+
+# Detect system specs
+get_cpu_cores() {
+    if [ -f /proc/cpuinfo ]; then
+        grep -c "processor" /proc/cpuinfo 2>/dev/null || echo "4"
+    else
+        echo "4"
+    fi
+}
+
+get_ram_gb() {
+    if [ -f /proc/meminfo ]; then
+        mem_kb=$(grep "MemTotal:" /proc/meminfo | awk '{print $2}')
+        echo $((mem_kb / 1024 / 1024))
+    else
+        echo "8"
+    fi
+}
+
+get_vram_gb() {
+    # NVIDIA GPU
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [ -n "$vram_mb" ]; then
+            echo $((vram_mb / 1024))
+            return
+        fi
+    fi
+    echo "0"
+}
+
+# Test bandwidth
+test_bandwidth() {
+    # Check cache first (valid for 7 days)
+    if [ -f "$BANDWIDTH_CACHE" ]; then
+        cache_age=$(($(date +%s) - $(stat -c %Y "$BANDWIDTH_CACHE" 2>/dev/null || echo 0)))
+        if [ $cache_age -lt 604800 ]; then
+            cat "$BANDWIDTH_CACHE"
+            return
+        fi
+    fi
+    
+    # Test with small file from GitHub
+    url="https://github.com/ollama/ollama/releases/download/v0.1.0/sha256sum.txt"
+    start_time=$(date +%s.%N 2>/dev/null || date +%s)
+    
+    if command -v curl >/dev/null 2>&1; then
+        size=$(curl -sL -w '%{size_download}' -o /dev/null "$url" 2>/dev/null)
+        end_time=$(date +%s.%N 2>/dev/null || date +%s)
+    else
+        echo "5.0"
+        return
+    fi
+    
+    # Calculate bandwidth
+    if [ -n "$size" ] && [ "$size" -gt 0 ]; then
+        # Handle both decimal and non-decimal time
+        if echo "$end_time" | grep -q '\.'; then
+            duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "1")
+        else
+            duration=$((end_time - start_time))
+            [ "$duration" -eq 0 ] && duration=1
+        fi
+        
+        # Avoid division by zero
+        if [ -z "$duration" ] || [ "$duration" = "0" ]; then
+            duration=1
+        fi
+        
+        # Calculate MB/s
+        if command -v bc >/dev/null 2>&1; then
+            bandwidth=$(echo "scale=1; $size / $duration / 1048576" | bc 2>/dev/null)
+        else
+            # Fallback without bc
+            bandwidth=$((size / duration / 1048576))
+        fi
+        
+        # Validate result
+        if [ -z "$bandwidth" ] || [ "$bandwidth" = "0" ]; then
+            bandwidth="5.0"
+        fi
+        
+        echo "$bandwidth" > "$BANDWIDTH_CACHE"
+        echo "$bandwidth"
+    else
+        echo "5.0"
+    fi
+}
+
+# Calculate system score
+calculate_score() {
+    cpu_cores=$(get_cpu_cores)
+    ram_gb=$(get_ram_gb)
+    vram_gb=$(get_vram_gb)
+    
+    # Score formula: (CPU cores × 0.5) + RAM + VRAM
+    if command -v bc >/dev/null 2>&1; then
+        score=$(echo "scale=1; ($cpu_cores * 0.5) + $ram_gb + $vram_gb" | bc)
+    else
+        # Integer math fallback
+        score=$(( (cpu_cores / 2) + ram_gb + vram_gb ))
+    fi
+    
+    echo "$score"
+}
+
+# Get model tier based on score
+get_model_tier() {
+    score="$1"
+    score_int=${score%.*}
+    
+    if [ "$score_int" -ge 64 ]; then
+        echo "enterprise"
+    elif [ "$score_int" -ge 32 ]; then
+        echo "advanced"
+    elif [ "$score_int" -ge 16 ]; then
+        echo "standard"
+    elif [ "$score_int" -ge 8 ]; then
+        echo "basic"
+    else
+        echo "minimal"
+    fi
+}
+
+# Generate models.toml
+echo "Updating models cache..."
+
+# Get system info
+cpu_cores=$(get_cpu_cores)
+ram_gb=$(get_ram_gb)
+vram_gb=$(get_vram_gb)
+score=$(calculate_score)
+tier=$(get_model_tier "$score")
+bandwidth=$(test_bandwidth)
+
+# Calculate download time estimates
+calc_download_time() {
+    size_gb="$1"
+    bandwidth_mbps="$2"
+    
+    if command -v bc >/dev/null 2>&1; then
+        seconds=$(echo "scale=0; ($size_gb * 1024) / $bandwidth_mbps" | bc 2>/dev/null || echo "0")
+    else
+        # Fallback
+        mb=$((size_gb * 1024))
+        seconds=$((mb / ${bandwidth_mbps%.*}))
+    fi
+    
+    if [ "$seconds" -lt 60 ]; then
+        echo "${seconds}s"
+    elif [ "$seconds" -lt 3600 ]; then
+        echo "$((seconds / 60))m"
+    else
+        echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+    fi
+}
+
+# Create TOML file
+cat > "$MODELS_TOML" << EOF
+# CasAInit Models Registry
+# Generated: $(date -u +%Y-%m-%dT%H:%MZ)
+# System Score: $score ($tier tier)
+# CPU: ${cpu_cores} cores | RAM: ${ram_gb}GB | VRAM: ${vram_gb}GB
+# Bandwidth: ${bandwidth} MB/s
+
+[system]
+score = $score
+tier = "$tier"
+cpu_cores = $cpu_cores
+ram_gb = $ram_gb
+vram_gb = $vram_gb
+bandwidth_mbps = $bandwidth
+
+# Ollama Models
+[llama2:7b]
+type = "ollama"
+url = "https://ollama.ai/library/llama2:7b"
+size_gb = 3.8
+size_hr = "3.8 GB"
+min_ram = 8
+min_vram = 6
+score = 10
+tier = "basic"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 3.8 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★★☆"
+
+[mixtral:8x7b]
+type = "ollama"
+url = "https://ollama.ai/library/mixtral:8x7b"
+size_gb = 26
+size_hr = "26 GB"
+min_ram = 32
+min_vram = 24
+score = 40
+tier = "advanced"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 26 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★★★"
+
+[codellama:13b]
+type = "ollama"
+url = "https://ollama.ai/library/codellama:13b"
+size_gb = 7.4
+size_hr = "7.4 GB"
+min_ram = 16
+min_vram = 10
+score = 18
+tier = "standard"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 7.4 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★★★"
+
+[mistral:7b]
+type = "ollama"
+url = "https://ollama.ai/library/mistral:7b"
+size_gb = 4.1
+size_hr = "4.1 GB"
+min_ram = 8
+min_vram = 6
+score = 10
+tier = "basic"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 4.1 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★★☆"
+
+[deepseek-coder:6.7b]
+type = "ollama"
+url = "https://ollama.ai/library/deepseek-coder:6.7b"
+size_gb = 3.8
+size_hr = "3.8 GB"
+min_ram = 8
+min_vram = 6
+score = 10
+tier = "basic"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 3.8 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★★☆"
+
+[phi:2.7b]
+type = "ollama"
+url = "https://ollama.ai/library/phi:2.7b"
+size_gb = 1.7
+size_hr = "1.7 GB"
+min_ram = 4
+min_vram = 2
+score = 5
+tier = "minimal"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 1.7 "$bandwidth")"
+format = "GGUF"
+quality_rating = "★★★☆☆"
+
+# TTS Models
+[en_us_libritts_high]
+type = "tts"
+url = "https://github.com/rhasspy/piper/releases/download/v1.0/en_us_libritts_high.tar.gz"
+size_gb = 0.975
+size_hr = "975 MB"
+min_ram = 2
+min_vram = 0
+score = 2
+tier = "minimal"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 0.975 "$bandwidth")"
+format = "ONNX"
+quality_rating = "★★★★★"
+
+[en_us_vctk]
+type = "tts"
+url = "https://github.com/rhasspy/piper/releases/download/v1.0/en_us_vctk.tar.gz"
+size_gb = 0.118
+size_hr = "118 MB"
+min_ram = 1
+min_vram = 0
+score = 1
+tier = "minimal"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 0.118 "$bandwidth")"
+format = "ONNX"
+quality_rating = "★★★★☆"
+
+# Diffusion Models
+[stable-diffusion-v1-5]
+type = "diffusion"
+url = "https://huggingface.co/runwayml/stable-diffusion-v1-5"
+size_gb = 4.3
+size_hr = "4.3 GB"
+min_ram = 8
+min_vram = 6
+score = 12
+tier = "basic"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 4.3 "$bandwidth")"
+format = "SafeTensors"
+quality_rating = "★★★★☆"
+
+[stable-diffusion-xl]
+type = "diffusion"
+url = "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0"
+size_gb = 6.9
+size_hr = "6.9 GB"
+min_ram = 16
+min_vram = 10
+score = 20
+tier = "standard"
+status = "stable"
+installed = "check"
+download_time = "$(calc_download_time 6.9 "$bandwidth")"
+format = "SafeTensors"
+quality_rating = "★★★★★"
+
+EOF
+
+echo "Models cache updated successfully!"
+echo "Found $(grep -c '^\[.*\]$' "$MODELS_TOML" | tail -n +2) models"
+echo "System tier: $tier (score: $score)"
+CACHE_SCRIPT_EOF
+}
+
+# Cron job management
+__setup_cron() {
+    __print_info "Installing cron jobs..."
+    
+    # Check if we can write to /etc/cron.d
+    cron_file="/etc/cron.d/casainit"
+    
+    if [ -w "/etc/cron.d" ] || (__is_root || (__command_exists sudo && sudo -n true 2>/dev/null)); then
+        # Create cron file content
+        cache_script_path="/usr/local/bin/casainit-model-cache.sh"
+        
+        # Create cache script if not already there
+        if [ ! -f "$cache_script_path" ]; then
+            __print_info "Creating model cache script..."
+            if __is_root; then
+                __create_model_cache_script > "$cache_script_path"
+                chmod +x "$cache_script_path"
+            else
+                __create_model_cache_script > /tmp/casainit-model-cache.$$
+                __sudo_run mv /tmp/casainit-model-cache.$$ "$cache_script_path"
+                __sudo_run chmod +x "$cache_script_path"
+            fi
+        fi
+        
+        # Create cron job content
+        cat > /tmp/casainit-cron.$$ << EOF
+# ─────────────────────────────────────────────────────────────── #
+# ⏰ CasAInit Cron Tasks — Auto Model Caching and Log Cleanup     #
+# ─────────────────────────────────────────────────────────────── #
+
+# Auto-cache models daily at 2 AM
+0 2 * * * root $cache_script_path >/dev/null 2>&1
+
+# Fix model permissions 3x daily (6 AM, 2 PM, 10 PM)
+0 6,14,22 * * * root find /var/lib/casainit/models -type d -exec chmod 777 {} + -o -type f -exec chmod 666 {} + 2>/dev/null
+
+# Cleanup logs weekly (Monday at 1 AM)
+0 1 * * 1 root find $LOG_DIR -type f -name "*.log" -mtime +7 -delete 2>/dev/null
+EOF
+        
+        # Install cron file
+        if __is_root; then
+            mv /tmp/casainit-cron.$$ "$cron_file"
+            chmod 644 "$cron_file"
+        else
+            __sudo_run mv /tmp/casainit-cron.$$ "$cron_file"
+            __sudo_run chmod 644 "$cron_file"
+        fi
+        
+        __print_success "Cron jobs installed"
+        return 0
+    else
+        __print_warn "Cannot install cron jobs without root access"
+        __print_info "To install manually, run: sudo $0 fix"
+        return 1
+    fi
+}
+
+# Command implementations
+cmd_install() {
+    __print_info "Starting CasAInit installation..."
+    
+    # Initialize environment
+    __env_init
+    
+    # Install prerequisites
+    __install_prerequisites || {
+        __print_err "Failed to install prerequisites"
+        return 1
+    }
+    
+    # Create required directories
+    __print_info "Creating directory structure..."
+    __ensure_dir "$MODELS_DIR/ollama"
+    __ensure_dir "$MODELS_DIR/tts"
+    __ensure_dir "$MODELS_DIR/diffusion"
+    
+    # Set proper permissions on model directories
+    __set_permissions "$MODELS_DIR" 777
+    __set_permissions "$MODELS_DIR/ollama" 777
+    __set_permissions "$MODELS_DIR/tts" 777
+    __set_permissions "$MODELS_DIR/diffusion" 777
+    
+    # Install individual tools
+    __print_info "Installing AI tools..."
+    __install_ollama || __print_warn "Failed to install Ollama"
+    # __install_opencode || __print_warn "Failed to install OpenCode"
+    __install_piper || __print_warn "Failed to install Piper"
+    __install_openwebui || __print_warn "Failed to install OpenWebUI"
+    __install_opendiffusion || __print_warn "Failed to install OpenDiffusion"
+    __install_continue || __print_warn "Failed to install Continue"
+    
+    # Select and install models
+    __print_info "Selecting AI models based on system capabilities..."
+    __select_default_models
+    
+    # Install default models
+    __print_info "Installing AI models..."
+    __env_load
+    if [ "$INSTALLED_ollama" = "yes" ]; then
+        __install_ollama_model "$DEFAULT_OLLAMA_MODEL" || __print_warn "Failed to install Ollama model"
+    fi
+    
+    # Setup cron jobs
+    __print_info "Setting up scheduled tasks..."
+    __setup_cron || __print_warn "Failed to setup cron jobs"
+    
+    __print_success "CasAInit installation complete!"
+    
+    # Show status
+    cmd_status
+}
+
+cmd_gpu() {
+    __print_header "GPU Information"
+    
+    gpu_type=$(__detect_gpu_type)
+    vram_gb=$(__detect_vram_gb)
+    
+    __print_status "GPU Type" "$gpu_type"
+    __print_status "VRAM" "${vram_gb} GB"
+    
+    if [ "$gpu_type" = "nvidia" ] && __command_exists nvidia-smi; then
+        __print_raw ""
+        __printf_color_line "$COLOR_CYAN" "NVIDIA GPU Details:"
+        nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+    elif [ "$gpu_type" = "amd" ] && __command_exists rocm-smi; then
+        __print_raw ""
+        __printf_color_line "$COLOR_CYAN" "AMD GPU Details:"
+        rocm-smi --showproductname
+    fi
+}
+
+cmd_status() {
+    __print_header "CasAInit Status"
+    
+    # System info
+    cpu_cores=$(__detect_cpu_cores)
+    ram_gb=$(__detect_ram_gb)
+    vram_gb=$(__detect_vram_gb)
+    gpu_type=$(__detect_gpu_type)
+    score=$(__get_system_score)
+    free_disk=$(__detect_free_disk_gb)
+    
+    __printf_color_line "$COLOR_BOLD" "System Information:"
+    __print_status "  CPU Cores" "$cpu_cores"
+    __print_status "  RAM" "${ram_gb} GB"
+    __print_status "  GPU" "$gpu_type"
+    __print_status "  VRAM" "${vram_gb} GB"
+    __print_status "  System Score" "$score"
+    __print_status "  Free Disk" "${free_disk} GB"
+    __print_raw ""
+    
+    # Check environment file
+    if [ -f "$ENV_FILE" ]; then
+        __env_load
+        
+        __printf_color_line "$COLOR_BOLD" "Installed Tools:"
+        if [ "$RAW_MODE" = "true" ]; then
+            [ "$INSTALLED_ollama" = "yes" ] && __print_raw "  * Ollama"
+            [ "$INSTALLED_opencode" = "yes" ] && __print_raw "  * OpenCode"
+            [ "$INSTALLED_piper" = "yes" ] && __print_raw "  * Piper"
+            [ "$INSTALLED_openwebui" = "yes" ] && __print_raw "  * OpenWebUI"
+            [ "$INSTALLED_opendiffusion" = "yes" ] && __print_raw "  * OpenDiffusion"
+            [ "$INSTALLED_continue" = "yes" ] && __print_raw "  * Continue"
+        else
+            [ "$INSTALLED_ollama" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Ollama"
+            [ "$INSTALLED_opencode" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenCode"
+            [ "$INSTALLED_piper" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Piper"
+            [ "$INSTALLED_openwebui" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenWebUI"
+            [ "$INSTALLED_opendiffusion" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenDiffusion"
+            [ "$INSTALLED_continue" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Continue"
+        fi
+    else
+        __print_warn "No installation found"
+    fi
+}
+
+# Service management
+cmd_service() {
+    action="${1:-status}"
+    service_name="${2:-all}"
+    
+    case "$action" in
+        start)
+            __service_start "$service_name"
+            ;;
+        stop)
+            __service_stop "$service_name"
+            ;;
+        restart)
+            __service_restart "$service_name"
+            ;;
+        status)
+            __service_status "$service_name"
+            ;;
+        *)
+            __print_err "Unknown service action: $action"
+            __print_info "Valid actions: start, stop, restart, status"
+            return 1
+            ;;
+    esac
+}
+
+__service_start() {
+    service="$1"
+    
+    if [ "$service" = "all" ]; then
+        __print_info "Starting all services..."
+        __env_load
+        
+        # Start binary services
+        [ "$INSTALLED_ollama" = "yes" ] && __service_start_binary "ollama"
+        [ "$INSTALLED_opencode" = "yes" ] && __service_start_binary "opencode"
+        [ "$INSTALLED_piper" = "yes" ] && __service_start_binary "piper"
+        
+        # Start container services
+        [ "$INSTALLED_openwebui" = "yes" ] && __service_start_container "openwebui"
+        [ "$INSTALLED_opendiffusion" = "yes" ] && __service_start_container "opendiffusion"
+    else
+        # Start specific service
+        __env_load
+        installed_var="INSTALLED_$service"
+        installed_val=$(eval printf '%s' "\$$installed_var")
+        
+        if [ "$installed_val" != "yes" ]; then
+            __print_err "Service $service is not installed"
+            return 1
+        fi
+        
+        # Determine if binary or container
+        case "$service" in
+            ollama|opencode|piper)
+                __service_start_binary "$service"
+                ;;
+            openwebui|opendiffusion)
+                __service_start_container "$service"
+                ;;
+            *)
+                __print_err "Unknown service: $service"
+                return 1
+                ;;
+        esac
+    fi
+}
+
+__service_start_binary() {
+    service="$1"
+    
+    if __command_exists systemctl; then
+        if systemctl --user is-active "casainit-$service" >/dev/null 2>&1; then
+            __print_info "$service is already running"
+        else
+            __print_info "Starting $service..."
+            systemctl --user start "casainit-$service" || {
+                __print_err "Failed to start $service"
+                return 1
+            }
+            __print_success "$service started"
+        fi
+    else
+        __print_warn "systemd not available, cannot manage $service"
+    fi
+}
+
+__service_start_container() {
+    service="$1"
+    real_user=$(__get_real_user)
+    container_name="${service}-${real_user}"
+    
+    if ! __command_exists docker; then
+        __print_err "Docker not installed"
+        return 1
+    fi
+    
+    # Check if already running
+    if docker ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        __print_info "$service container is already running"
+        return 0
+    fi
+    
+    __print_info "Starting $service container..."
+    
+    # Get port from environment
+    port_var="PORT_$service"
+    port=$(eval printf '%s' "\$$port_var")
+    
+    case "$service" in
+        openwebui)
+            docker run -d \
+                --name "$container_name" \
+                --restart always \
+                --pull always \
+                -p "${port:-3000}:8080" \
+                -v "$MODELS_DIR:/models" \
+                -v "$CONFIG_DIR/$service:/app/backend/data" \
+                ghcr.io/open-webui/open-webui:latest || {
+                    __print_err "Failed to start OpenWebUI"
+                    return 1
+                }
+            ;;
+        opendiffusion)
+            gpu_flags=""
+            [ "$(__detect_gpu_type)" = "nvidia" ] && gpu_flags="--gpus all"
+            
+            docker run -d \
+                --name "$container_name" \
+                --restart always \
+                --pull always \
+                $gpu_flags \
+                -p "${port:-7860}:7860" \
+                -v "$MODELS_DIR/diffusion:/models" \
+                -v "$CONFIG_DIR/$service:/data" \
+                stabilityai/stable-diffusion-webui:latest || {
+                    __print_err "Failed to start OpenDiffusion"
+                    return 1
+                }
+            ;;
+    esac
+    
+    __print_success "$service container started"
+}
+
+__service_stop() {
+    service="$1"
+    
+    if [ "$service" = "all" ]; then
+        __print_info "Stopping all services..."
+        __env_load
+        
+        # Stop binary services
+        [ "$INSTALLED_ollama" = "yes" ] && __service_stop_binary "ollama"
+        [ "$INSTALLED_opencode" = "yes" ] && __service_stop_binary "opencode"
+        [ "$INSTALLED_piper" = "yes" ] && __service_stop_binary "piper"
+        
+        # Stop container services
+        [ "$INSTALLED_openwebui" = "yes" ] && __service_stop_container "openwebui"
+        [ "$INSTALLED_opendiffusion" = "yes" ] && __service_stop_container "opendiffusion"
+    else
+        # Stop specific service
+        case "$service" in
+            ollama|opencode|piper)
+                __service_stop_binary "$service"
+                ;;
+            openwebui|opendiffusion)
+                __service_stop_container "$service"
+                ;;
+            *)
+                __print_err "Unknown service: $service"
+                return 1
+                ;;
+        esac
+    fi
+}
+
+__service_stop_binary() {
+    service="$1"
+    
+    if __command_exists systemctl; then
+        __print_info "Stopping $service..."
+        systemctl --user stop "casainit-$service" || {
+            __print_err "Failed to stop $service"
+            return 1
+        }
+        __print_success "$service stopped"
+    else
+        __print_warn "systemd not available, cannot manage $service"
+    fi
+}
+
+__service_stop_container() {
+    service="$1"
+    real_user=$(__get_real_user)
+    container_name="${service}-${real_user}"
+    
+    if ! __command_exists docker; then
+        __print_err "Docker not installed"
+        return 1
+    fi
+    
+    __print_info "Stopping $service container..."
+    docker stop "$container_name" >/dev/null 2>&1 || {
+        __print_warn "$service container not running"
+        return 0
+    }
+    
+    docker rm "$container_name" >/dev/null 2>&1
+    __print_success "$service container stopped"
+}
+
+__service_restart() {
+    service="$1"
+    __service_stop "$service"
+    sleep 2
+    __service_start "$service"
+}
+
+__service_status() {
+    service="$1"
+    
+    __print_info "Service Status:"
+    __print_raw ""
+    
+    if [ "$service" = "all" ]; then
+        __env_load
+        
+        # Check binary services
+        for svc in ollama opencode piper; do
+            installed_var="INSTALLED_$svc"
+            installed_val=$(eval printf '%s' "\$$installed_var")
+            
+            if [ "$installed_val" = "yes" ]; then
+                __service_status_binary "$svc"
+            fi
+        done
+        
+        # Check container services
+        for svc in openwebui opendiffusion; do
+            installed_var="INSTALLED_$svc"
+            installed_val=$(eval printf '%s' "\$$installed_var")
+            
+            if [ "$installed_val" = "yes" ]; then
+                __service_status_container "$svc"
+            fi
+        done
+    else
+        # Check specific service
+        case "$service" in
+            ollama|opencode|piper)
+                __service_status_binary "$service"
+                ;;
+            openwebui|opendiffusion)
+                __service_status_container "$service"
+                ;;
+            *)
+                __print_err "Unknown service: $service"
+                return 1
+                ;;
+        esac
+    fi
+}
+
+__service_status_binary() {
+    service="$1"
+    
+    if __command_exists systemctl; then
+        if systemctl --user is-active "casainit-$service" >/dev/null 2>&1; then
+            __print_raw "  $service: ✓ Running (systemd)"
+        else
+            __print_raw "  $service: ✗ Stopped"
+        fi
+    else
+        # Fallback to process check
+        if pgrep -f "$service" >/dev/null 2>&1; then
+            __print_raw "  $service: ✓ Running (process)"
+        else
+            __print_raw "  $service: ✗ Not running"
+        fi
+    fi
+}
+
+__service_status_container() {
+    service="$1"
+    real_user=$(__get_real_user)
+    container_name="${service}-${real_user}"
+    
+    if ! __command_exists docker; then
+        __print_raw "  $service: ? Docker not available"
+        return
+    fi
+    
+    if docker ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        # Get port mapping
+        port_info=$(docker port "$container_name" 2>/dev/null | head -n1 | cut -d' ' -f3)
+        __print_raw "  $service: ✓ Running (container) - $port_info"
+    else
+        __print_raw "  $service: ✗ Stopped"
+    fi
+}
+
+# Models command implementation
+cmd_models() {
+    action="${1:-remote}"
+    
+    case "$action" in
+        remote)
+            __models_list_remote
+            ;;
+        installed)
+            __models_list_installed
+            ;;
+        refresh|cache)
+            __models_refresh_cache
+            ;;
+        install)
+            shift
+            __models_install "$@"
+            ;;
+        *)
+            __print_err "Unknown models action: $action"
+            __print_info "Valid actions: remote, installed, refresh, install"
+            return 1
+            ;;
+    esac
+}
+
+__models_list_remote() {
+    __print_info "Available Models:"
+    
+    if [ ! -f "$MODELS_TOML" ]; then
+        __print_warn "Models cache not found. Updating..."
+        __models_refresh_cache
+    fi
+    
+    if [ ! -f "$MODELS_TOML" ]; then
+        __print_err "Failed to load models cache"
+        return 1
+    fi
+    
+    # Parse and display models
+    __print_raw ""
+    if [ "$RAW_MODE" = "true" ]; then
+        # Raw output - tab separated
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "MODEL" "TYPE" "STATUS" "SCORE" "INSTALLED" "SIZE" "FORMAT" "QUALITY"
+        printf '%s\n' "------------------------------------------------------------------------"
+    fi
+    
+    # Read models from TOML (simplified parser)
+    current_model=""
+    while IFS= read -r line; do
+        case "$line" in
+            \[*\])
+                # New model section
+                current_model=$(printf '%s' "$line" | sed 's/\[\(.*\)\]/\1/')
+                ;;
+            type\ =*)
+                [ -n "$current_model" ] && model_type=$(printf '%s' "$line" | cut -d'"' -f2)
+                ;;
+            status\ =*)
+                [ -n "$current_model" ] && status=$(printf '%s' "$line" | cut -d'"' -f2)
+                ;;
+            score\ =*)
+                [ -n "$current_model" ] && score=$(printf '%s' "$line" | cut -d'=' -f2 | tr -d ' ')
+                ;;
+            installed\ =*)
+                [ -n "$current_model" ] && installed=$(printf '%s' "$line" | cut -d'"' -f2)
+                ;;
+            size_hr\ =*)
+                [ -n "$current_model" ] && size_hr=$(printf '%s' "$line" | cut -d'"' -f2)
+                ;;
+            format\ =*)
+                [ -n "$current_model" ] && format=$(printf '%s' "$line" | cut -d'"' -f2)
+                ;;
+            quality_rating\ =*)
+                if [ -n "$current_model" ] && [ -n "$model_type" ]; then
+                    quality=$(printf '%s' "$line" | cut -d'"' -f2)
+                    
+                    # Apply type filter if specified
+                    if [ -z "$TYPE_FILTER" ] || printf '%s' "$TYPE_FILTER" | grep -q "$model_type"; then
+                        if [ "$RAW_MODE" = "true" ]; then
+                            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                                "$current_model" "$model_type" "$status" "$score" \
+                                "$installed" "$size_hr" "$format" "$quality"
+                        else
+                            # Formatted output with colors
+                            status_icon="?"
+                            status_color="$COLOR_RESET"
+                            case "$status" in
+                                good)
+                                    status_icon="✅"
+                                    status_color="$COLOR_GREEN"
+                                    ;;
+                                ok)
+                                    status_icon="🟡"
+                                    status_color="$COLOR_YELLOW"
+                                    ;;
+                                warn)
+                                    status_icon="⚠️"
+                                    status_color="$COLOR_YELLOW"
+                                    ;;
+                                bad)
+                                    status_icon="❌"
+                                    status_color="$COLOR_RED"
+                                    ;;
+                            esac
+                            
+                            printf '%b%-20s %-12s %s%s %-6s' \
+                                "$COLOR_BOLD" "$current_model" "[$model_type]" \
+                                "$status_color" "$status_icon" "$status"
+                            __printf_reset_color
+                            printf ' 💾 %-8s 🧠 Score: %-5s 🔢 %s' \
+                                "$size_hr" "$score" "$quality"
+                            __printf_newline_color
+                        fi
+                    fi
+                    
+                    # Reset for next model
+                    current_model=""
+                    model_type=""
+                fi
+                ;;
+        esac
+    done < "$MODELS_TOML"
+}
+
+__models_list_installed() {
+    __print_info "Installed Models:"
+    __print_raw ""
+    
+    # Check Ollama models
+    if __command_exists ollama; then
+        __print_raw "Ollama models:"
+        ollama list 2>/dev/null | tail -n +2 || __print_raw "  None installed"
+    fi
+    
+    # Check TTS models
+    if [ -d "$MODELS_DIR/tts" ]; then
+        __print_raw ""
+        __print_raw "TTS models:"
+        find "$MODELS_DIR/tts" -name "*.onnx" -o -name "*.pt" 2>/dev/null | \
+            while read -r model; do
+                basename "$model"
+            done || __print_raw "  None installed"
+    fi
+    
+    # Check Diffusion models
+    if [ -d "$MODELS_DIR/diffusion" ]; then
+        __print_raw ""
+        __print_raw "Diffusion models:"
+        find "$MODELS_DIR/diffusion" -name "*.safetensors" -o -name "*.ckpt" 2>/dev/null | \
+            while read -r model; do
+                basename "$model"
+            done || __print_raw "  None installed"
+    fi
+}
+
+__models_refresh_cache() {
+    __print_info "Refreshing models cache..."
+    
+    # Check for existing cache script in standard locations
+    cache_script=""
+    for loc in "/usr/local/bin/casainit-model-cache.sh" "$HOME/.local/bin/casainit-model-cache.sh"; do
+        if [ -f "$loc" ]; then
+            cache_script="$loc"
+            break
+        fi
+    done
+    
+    # If not found, create it temporarily
+    if [ -z "$cache_script" ]; then
+        cache_script="/tmp/casainit-model-cache-$$.sh"
+        __create_model_cache_script > "$cache_script"
+        chmod +x "$cache_script"
+        temp_script=true
+    fi
+    
+    # Run the cache script
+    sh "$cache_script" || {
+        __print_err "Failed to update models cache"
+        [ "$temp_script" = "true" ] && rm -f "$cache_script"
+        return 1
+    }
+    
+    # Clean up temp script
+    [ "$temp_script" = "true" ] && rm -f "$cache_script"
+    
+    __env_set "LAST_CACHE_RUN" "$(date -u +%Y-%m-%dT%H:%MZ)"
+    __print_success "Models cache updated"
+}
+
+__models_install() {
+    model_name="$1"
+    
+    if [ -z "$model_name" ]; then
+        __print_err "No model specified"
+        __print_info "Usage: casainit models install <model_name>"
+        return 1
+    fi
+    
+    __print_info "Installing model: $model_name"
+    
+    # For now, only handle Ollama models
+    if __command_exists ollama; then
+        __install_ollama_model "$model_name"
+    else
+        __print_err "Model installation requires the appropriate tool to be installed first"
+        return 1
+    fi
+}
+
+# Uninstall command implementation
+cmd_uninstall() {
+    __print_info "Uninstalling CasAInit and all components..."
+    
+    # Check for confirmation unless --yes flag is set
+    if [ "$FORCE_YES" != "true" ]; then
+        printf '%b%s Are you sure you want to uninstall CasAInit? This will remove all installed tools and configurations. [y/N]: %b' \
+            "$COLOR_YELLOW" "$ICON_WARN" "$COLOR_RESET"
+        read -r response
+        case "$response" in
+            [yY][eE][sS]|[yY])
+                __print_info "Proceeding with uninstall..."
+                ;;
+            *)
+                __print_info "Uninstall cancelled"
+                return 0
+                ;;
+        esac
+    fi
+    
+    # Stop all services first
+    __print_info "Stopping all services..."
+    
+    # Stop systemd services
+    for service in ollama piper opencode; do
+        service_name="casainit-${service}.service"
+        if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+            __print_info "Stopping $service_name..."
+            if __is_root; then
+                systemctl stop "$service_name" >/dev/null 2>&1
+                systemctl disable "$service_name" >/dev/null 2>&1
+            else
+                sudo systemctl stop "$service_name" >/dev/null 2>&1
+                sudo systemctl disable "$service_name" >/dev/null 2>&1
+            fi
+        fi
+        
+        # Remove systemd service file
+        if [ -f "/etc/systemd/system/$service_name" ]; then
+            __print_info "Removing $service_name..."
+            if __is_root; then
+                rm -f "/etc/systemd/system/$service_name"
+            else
+                sudo rm -f "/etc/systemd/system/$service_name"
+            fi
+        fi
+    done
+    
+    # Stop Docker containers
+    if __command_exists docker; then
+        __print_info "Stopping Docker containers..."
+        current_user=$(whoami)
+        
+        for container in openwebui opendiffusion text-generation-webui privategpt stable-diffusion-comfyui localai; do
+            container_name="${container}-${current_user}"
+            if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+                __print_info "Removing container $container_name..."
+                docker stop "$container_name" >/dev/null 2>&1
+                docker rm "$container_name" >/dev/null 2>&1
+            fi
+        done
+    fi
+    
+    # Remove cron jobs
+    if [ -f "/etc/cron.d/casainit" ]; then
+        __print_info "Removing cron jobs..."
+        if __is_root; then
+            rm -f "/etc/cron.d/casainit"
+        else
+            sudo rm -f "/etc/cron.d/casainit"
+        fi
+    fi
+    
+    # Remove binaries
+    __print_info "Removing installed binaries..."
+    for binary in ollama piper opencode whisper llama-cpp; do
+        bin_path="$HOME/.local/bin/$binary"
+        if [ -f "$bin_path" ] || [ -L "$bin_path" ]; then
+            __print_info "Removing $binary..."
+            rm -f "$bin_path"
+        fi
+    done
+    
+    # Remove installation directories
+    __print_info "Removing installation directories..."
+    if [ -d "$HOME/.local/share/casainit" ]; then
+        rm -rf "$HOME/.local/share/casainit"
+    fi
+    
+    # Ask about removing models and configurations
+    if [ "$FORCE_YES" != "true" ]; then
+        printf '%b%s Remove downloaded models and configurations? This will delete all AI models (potentially many GB). [y/N]: %b' \
+            "$COLOR_YELLOW" "$ICON_WARN" "$COLOR_RESET"
+        read -r response
+        case "$response" in
+            [yY][eE][sS]|[yY])
+                remove_data=true
+                ;;
+            *)
+                remove_data=false
+                __print_info "Keeping models and configurations"
+                ;;
+        esac
+    else
+        # In non-interactive mode, use REMOVE_DATA flag
+        remove_data="$REMOVE_DATA"
+        if [ "$remove_data" = "false" ]; then
+            __print_info "Keeping models and configurations (use --remove-data to delete)"
+        fi
+    fi
+    
+    if [ "$remove_data" = "true" ]; then
+        __print_info "Removing models and configurations..."
+        
+        # Remove Ollama models
+        if [ -d "$HOME/.ollama" ]; then
+            __print_info "Removing Ollama models..."
+            rm -rf "$HOME/.ollama"
+        fi
+        
+        # Remove shared models directory
+        if [ -d "$MODELS_DIR" ]; then
+            __print_info "Removing shared models..."
+            rm -rf "$MODELS_DIR"
+        fi
+        
+        # Remove configuration directory
+        if [ -d "$CONFIG_DIR" ]; then
+            __print_info "Removing configurations..."
+            rm -rf "$CONFIG_DIR"
+        fi
+    fi
+    
+    # Remove VS Code Continue extension settings
+    vscode_dir="$HOME/.config/Code/User"
+    if [ -f "$vscode_dir/settings.json" ]; then
+        __print_info "Cleaning VS Code Continue settings..."
+        # This would need proper JSON parsing, so we'll just notify
+        __print_warn "Please manually remove Continue extension settings from VS Code if needed"
+    fi
+    
+    # Clean up PATH from shell RC files
+    __print_info "Cleaning PATH from shell configuration..."
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ -f "$rc_file" ]; then
+            # Remove our PATH addition
+            sed -i '/# Added by CasAInit/,+1d' "$rc_file" 2>/dev/null || true
+        fi
+    done
+    
+    # Reload systemd daemon
+    if __is_root; then
+        systemctl daemon-reload >/dev/null 2>&1
+    else
+        sudo systemctl daemon-reload >/dev/null 2>&1
+    fi
+    
+    __print_success "CasAInit has been uninstalled"
+    
+    if [ "$remove_data" = "false" ]; then
+        __print_info "Models and configurations were preserved at:"
+        __print_raw "  - Models: $MODELS_DIR"
+        __print_raw "  - Config: $CONFIG_DIR"
+        __print_raw "  - Ollama: $HOME/.ollama"
+    fi
+    
+    __print_info "Thank you for using CasAInit!"
+}
+
+# Fix command implementation
+cmd_fix() {
+    __print_info "Fixing CasAInit installation..."
+    
+    # Initialize environment if needed
+    __env_init
+    
+    # Fix directory permissions
+    __print_info "Fixing directory permissions..."
+    
+    # Create all required directories
+    __ensure_dir "$CONFIG_DIR"
+    __ensure_dir "$BIN_DIR"
+    __ensure_dir "$SHARE_DIR"
+    __ensure_dir "$LOG_DIR"
+    __ensure_dir "$CACHE_DIR"
+    
+    # Fix model directory permissions
+    if [ -d "$MODELS_DIR" ]; then
+        __print_info "Fixing model directory permissions..."
+        if __is_root || (__command_exists sudo && sudo -n true 2>/dev/null); then
+            if __is_root; then
+                chmod 777 "$MODELS_DIR"
+                find "$MODELS_DIR" -type d -exec chmod 777 {} +
+                find "$MODELS_DIR" -type f -exec chmod 666 {} +
+            else
+                __sudo_run chmod 777 "$MODELS_DIR"
+                __sudo_run find "$MODELS_DIR" -type d -exec chmod 777 {} +
+                __sudo_run find "$MODELS_DIR" -type f -exec chmod 666 {} +
+            fi
+            __print_success "Model permissions fixed"
+        else
+            __print_warn "Need root access to fix model permissions"
+        fi
+    else
+        __print_info "Creating model directories..."
+        if __is_root || (__command_exists sudo && sudo -n true 2>/dev/null); then
+            if __is_root; then
+                mkdir -p "$MODELS_DIR/ollama" "$MODELS_DIR/tts" "$MODELS_DIR/diffusion"
+                chmod 777 "$MODELS_DIR" "$MODELS_DIR/ollama" "$MODELS_DIR/tts" "$MODELS_DIR/diffusion"
+            else
+                __sudo_run mkdir -p "$MODELS_DIR/ollama" "$MODELS_DIR/tts" "$MODELS_DIR/diffusion"
+                __sudo_run chmod 777 "$MODELS_DIR" "$MODELS_DIR/ollama" "$MODELS_DIR/tts" "$MODELS_DIR/diffusion"
+            fi
+            __print_success "Model directories created"
+        fi
+    fi
+    
+    # Fix PATH if needed
+    if ! printf '%s' "$PATH" | grep -q "$BIN_DIR"; then
+        __print_info "Adding $BIN_DIR to PATH..."
+        
+        # Add to shell rc files
+        for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+            if [ -f "$rc_file" ]; then
+                if ! grep -q "PATH.*$BIN_DIR" "$rc_file"; then
+                    printf '\n# Added by CasAInit\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$rc_file"
+                    __print_success "Updated $rc_file"
+                fi
+            fi
+        done
+        
+        __print_info "Please restart your shell or run: export PATH=\"$BIN_DIR:\$PATH\""
+    fi
+    
+    # Reinstall cron jobs
+    __setup_cron
+    
+    # Fix systemd services
+    __print_info "Checking systemd services..."
+    __env_load
+    
+    for service in ollama opencode piper; do
+        installed_var="INSTALLED_$service"
+        installed_val=$(eval printf '%s' "\$$installed_var")
+        
+        if [ "$installed_val" = "yes" ]; then
+            service_file="$HOME/.config/systemd/user/casainit-$service.service"
+            if [ ! -f "$service_file" ]; then
+                __print_warn "Service file missing for $service, recreating..."
+                case "$service" in
+                    ollama)
+                        __create_ollama_service
+                        ;;
+                    # Add other service creators as they're implemented
+                esac
+            fi
+        fi
+    done
+    
+    # Reload systemd
+    if __command_exists systemctl; then
+        systemctl --user daemon-reload
+    fi
+    
+    # Fix docker group membership
+    real_user=$(__get_real_user)
+    if ! groups "$real_user" 2>/dev/null | grep -q docker; then
+        if __command_exists docker && (__is_root || (__command_exists sudo && sudo -n true 2>/dev/null)); then
+            __print_info "Adding $real_user to docker group..."
+            if __is_root; then
+                usermod -aG docker "$real_user"
+            else
+                sudo usermod -aG docker "$real_user"
+            fi
+            __print_warn "You need to log out and back in for docker group changes to take effect"
+        fi
+    fi
+    
+    __print_success "Fix completed!"
+    
+    # Show status
+    cmd_status
+}
+
+# Run main function
+main "$@"
