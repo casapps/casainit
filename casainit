@@ -3,7 +3,92 @@
 # https://github.com/casapps/casainit
 # MIT License
 
-set -u
+set -eu
+
+# Cleanup on exit
+CLEANUP_TEMP_FILES=""
+CLEANUP_ON_ERROR=true
+cleanup() {
+    # Always clean temp files
+    if [ -n "$CLEANUP_TEMP_FILES" ]; then
+        for file in $CLEANUP_TEMP_FILES; do
+            rm -f "$file" 2>/dev/null
+        done
+    fi
+    
+    # Clean up partial installations on error
+    exit_code=$?
+    if [ $exit_code -ne 0 ] && [ "$CLEANUP_ON_ERROR" = "true" ]; then
+        # Use basic echo if print functions aren't available yet
+        if command -v __print_warn >/dev/null 2>&1; then
+            __print_warn "Installation failed, cleaning up..."
+        else
+            echo "Installation failed, cleaning up..." >&2
+        fi
+        
+        # Stop any services we started
+        for service in ollama piper opencode; do
+            if systemctl --user is-active "casainit-$service" >/dev/null 2>&1; then
+                systemctl --user stop "casainit-$service" 2>/dev/null
+                systemctl --user disable "casainit-$service" 2>/dev/null
+            fi
+            # Remove service files
+            rm -f "$HOME/.config/systemd/user/casainit-$service.service" 2>/dev/null
+        done
+        
+        # Stop and remove Docker containers
+        if command -v docker >/dev/null 2>&1; then
+            real_user="${SUDO_USER:-$USER}"
+            for container in openwebui-$real_user opendiffusion-$real_user; do
+                docker stop "$container" 2>/dev/null
+                docker rm "$container" 2>/dev/null
+            done
+        fi
+        
+        # Remove binaries we symlinked
+        for binary in ollama piper opencode; do
+            rm -f "$HOME/.local/bin/$binary" 2>/dev/null
+        done
+        
+        # Remove extracted files but keep downloads
+        rm -rf "$HOME/.local/share/casainit/ollama" 2>/dev/null
+        rm -rf "$HOME/.local/share/casainit/piper" 2>/dev/null
+        rm -rf "$HOME/.local/share/casainit/opencode" 2>/dev/null
+        
+        # Remove empty directories
+        rmdir "$HOME/.local/share/casainit" 2>/dev/null
+        rmdir "$HOME/.local/log/casainit" 2>/dev/null
+        rmdir "$HOME/.cache/casainit" 2>/dev/null
+        
+        # Remove config if it's empty or just has partial data
+        if [ -f "$HOME/.config/casainit/settings.env" ]; then
+            # Check if we have any successful installations
+            if ! grep -q "INSTALLED_.*=\"yes\"" "$HOME/.config/casainit/settings.env" 2>/dev/null; then
+                rm -rf "$HOME/.config/casainit" 2>/dev/null
+            fi
+        fi
+        
+        # Remove cron job if we created it
+        if [ -f "/etc/cron.d/casainit" ]; then
+            if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+                rm -f /etc/cron.d/casainit 2>/dev/null || sudo rm -f /etc/cron.d/casainit 2>/dev/null
+            fi
+        fi
+        
+        # Remove model directories if empty
+        if [ -d "/var/lib/casainit/models" ]; then
+            find /var/lib/casainit/models -type d -empty -delete 2>/dev/null
+            rmdir /var/lib/casainit 2>/dev/null
+        fi
+        
+        if command -v __print_info >/dev/null 2>&1; then
+            __print_info "Cleanup completed"
+        else
+            echo "Cleanup completed" >&2
+        fi
+    fi
+}
+trap cleanup EXIT INT TERM
 
 # Script metadata
 SCRIPT_VERSION="1.0.0"
@@ -749,7 +834,10 @@ __set_permissions() {
         return 0
     fi
     
-    __sudo_run chmod "$perms" "$path"
+    __sudo_run chmod "$perms" "$path" || {
+        __print_err "Failed to set permissions on $path"
+        return 1
+    }
 }
 
 # Get real user when running with sudo
@@ -1187,6 +1275,9 @@ __gh_get_release_url() {
     repo="$1"  # e.g., "ollama/ollama"
     filter="${2:-}"  # Optional filter pattern
     
+    # Extract tool name from repo
+    tool_name=$(echo "$repo" | cut -d'/' -f2)
+    
     # Get latest release info from GitHub API
     api_url="https://api.github.com/repos/$repo/releases/latest"
     
@@ -1198,13 +1289,27 @@ __gh_get_release_url() {
         return 1
     fi
     
+    # Check for API rate limit or errors
+    if echo "$release_data" | grep -q "API rate limit exceeded"; then
+        __print_err "GitHub API rate limit exceeded"
+        return 1
+    fi
+    
+    if echo "$release_data" | grep -q '"message"'; then
+        error_msg=$(echo "$release_data" | grep -o '"message": *"[^"]*"' | cut -d'"' -f4)
+        __print_err "GitHub API error: $error_msg"
+        return 1
+    fi
+    
     # Get system architecture
     sys_arch=$(__detect_arch)
     arch_pattern=""
     
     case "$sys_arch" in
         x86_64)
-            arch_pattern="x86_64\|amd64\|x64"
+            # For Ollama: ollama-linux-amd64.tgz
+            # For Piper: piper_linux_x86_64.tar.gz
+            arch_pattern="amd64\|x86_64\|x64"
             ;;
         aarch64|arm64)
             arch_pattern="arm64\|aarch64"
@@ -1216,16 +1321,39 @@ __gh_get_release_url() {
     esac
     
     # Parse download URL based on architecture
-    download_url=$(printf '%s' "$release_data" | \
-        grep -o '"browser_download_url": *"[^"]*"' | \
-        cut -d'"' -f4 | \
+    all_urls=$(printf '%s' "$release_data" | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4)
+    
+    # Try to find Linux binary for our architecture
+    # First try non-ROCm versions for regular users
+    download_url=$(printf '%s' "$all_urls" | \
         grep -i "linux" | \
-        grep -E "$arch_pattern" | \
-        grep -v "sha256\|sig\|asc" | \
+        grep -i "$arch_pattern" | \
+        grep -v "sha256\|sig\|asc\|\.deb\|\.rpm\|rocm" | \
         head -n1)
     
+    # If no non-ROCm found, try ROCm versions
     if [ -z "$download_url" ]; then
-        __print_err "No suitable download found for $sys_arch"
+        download_url=$(printf '%s' "$all_urls" | \
+            grep -i "linux" | \
+            grep -i "$arch_pattern" | \
+            grep -i "rocm" | \
+            grep -v "sha256\|sig\|asc\|\.deb\|\.rpm" | \
+            head -n1)
+    fi
+    
+    # If no linux-specific found, try without linux filter (for tools that don't specify OS)
+    if [ -z "$download_url" ]; then
+        download_url=$(printf '%s' "$all_urls" | \
+            grep -i "$arch_pattern" | \
+            grep -v "sha256\|sig\|asc\|\.deb\|\.rpm\|darwin\|windows\|rocm" | \
+            head -n1)
+    fi
+    
+    if [ -z "$download_url" ]; then
+        __print_err "No suitable $tool_name download found for $sys_arch"
+        __print_info "Looking for pattern: $arch_pattern"
+        __print_info "Available downloads:"
+        printf '%s\n' "$all_urls" | sed 's/.*\//  - /' | head -10
         return 1
     fi
     
@@ -1300,15 +1428,15 @@ __install_ollama() {
     # Get download URL from GitHub
     download_url=$(__gh_get_release_url "ollama/ollama")
     if [ -z "$download_url" ]; then
-        __print_err "Failed to get Ollama download URL"
+        __print_err "Failed to find Ollama binary for your system"
         return 1
     fi
     
     # Download to temp file
     temp_file="/tmp/ollama-$$.tar.gz"
+    CLEANUP_TEMP_FILES="$CLEANUP_TEMP_FILES $temp_file"
     if ! __download_file "$download_url" "$temp_file"; then
         __print_err "Failed to download Ollama"
-        rm -f "$temp_file"
         return 1
     fi
     
@@ -1512,32 +1640,33 @@ main() {
     # Initialize directories
     __init_env
     
-    # Execute command
+    # Execute command and capture exit code
+    exit_code=0
     case "$COMMAND" in
         install)
-            cmd_install
+            cmd_install || exit_code=$?
             ;;
         uninstall)
-            cmd_uninstall
+            cmd_uninstall || exit_code=$?
             ;;
         update)
             # Update is an alias for install
-            cmd_install
+            cmd_install || exit_code=$?
             ;;
         service)
-            cmd_service "$SUBCOMMAND" "$SERVICE_NAME"
+            cmd_service "$SUBCOMMAND" "$SERVICE_NAME" || exit_code=$?
             ;;
         models)
-            cmd_models "$SUBCOMMAND"
+            cmd_models "$SUBCOMMAND" || exit_code=$?
             ;;
         fix)
-            cmd_fix
+            cmd_fix || exit_code=$?
             ;;
         gpu)
-            cmd_gpu
+            cmd_gpu || exit_code=$?
             ;;
         status)
-            cmd_status
+            cmd_status || exit_code=$?
             ;;
         *)
             __print_err "Unknown command: $COMMAND"
@@ -1545,6 +1674,9 @@ main() {
             exit 1
             ;;
     esac
+    
+    # Exit with the command's exit code
+    exit $exit_code
 }
 
 # Model management functions
@@ -1718,9 +1850,9 @@ __install_piper() {
     
     # Download to temp file
     temp_file="/tmp/piper-$$.tar.gz"
+    CLEANUP_TEMP_FILES="$CLEANUP_TEMP_FILES $temp_file"
     if ! __download_file "$download_url" "$temp_file"; then
         __print_err "Failed to download Piper"
-        rm -f "$temp_file"
         return 1
     fi
     
@@ -1946,11 +2078,16 @@ __install_continue() {
         return 0
     fi
     
-    # Install the extension
+    # Install the extension in headless mode to prevent VS Code from opening
     __print_info "Installing Continue extension..."
-    if code --install-extension continue.continue; then
-        __print_success "Continue extension installed"
-        __env_set "INSTALLED_continue" "yes"
+    # Set DISPLAY to empty to force headless mode
+    if ! DISPLAY= code --install-extension continue.continue --force >/dev/null 2>&1; then
+        __print_err "Failed to install Continue extension"
+        return 1
+    fi
+    
+    __print_success "Continue extension installed"
+    __env_set "INSTALLED_continue" "yes"
         
         # Create config directory
         __ensure_dir "$CONFIG_DIR/continue"
@@ -2418,24 +2555,48 @@ cmd_install() {
     
     # Create required directories
     __print_info "Creating directory structure..."
-    __ensure_dir "$MODELS_DIR/ollama"
-    __ensure_dir "$MODELS_DIR/tts"
-    __ensure_dir "$MODELS_DIR/diffusion"
+    __ensure_dir "$MODELS_DIR/ollama" || return 1
+    __ensure_dir "$MODELS_DIR/tts" || return 1
+    __ensure_dir "$MODELS_DIR/diffusion" || return 1
     
     # Set proper permissions on model directories
-    __set_permissions "$MODELS_DIR" 777
-    __set_permissions "$MODELS_DIR/ollama" 777
-    __set_permissions "$MODELS_DIR/tts" 777
-    __set_permissions "$MODELS_DIR/diffusion" 777
+    __set_permissions "$MODELS_DIR" 777 || return 1
+    __set_permissions "$MODELS_DIR/ollama" 777 || return 1
+    __set_permissions "$MODELS_DIR/tts" 777 || return 1
+    __set_permissions "$MODELS_DIR/diffusion" 777 || return 1
     
-    # Install individual tools
+    # Install individual tools - fail on any error
     __print_info "Installing AI tools..."
-    __install_ollama || __print_warn "Failed to install Ollama"
-    # __install_opencode || __print_warn "Failed to install OpenCode"
-    __install_piper || __print_warn "Failed to install Piper"
-    __install_openwebui || __print_warn "Failed to install OpenWebUI"
-    __install_opendiffusion || __print_warn "Failed to install OpenDiffusion"
-    __install_continue || __print_warn "Failed to install Continue"
+    
+    __install_ollama || {
+        __print_err "Failed to install Ollama - installation aborted"
+        return 1
+    }
+    
+    # __install_opencode || {
+    #     __print_err "Failed to install OpenCode - installation aborted"
+    #     return 1
+    # }
+    
+    __install_piper || {
+        __print_err "Failed to install Piper - installation aborted"
+        return 1
+    }
+    
+    __install_openwebui || {
+        __print_err "Failed to install OpenWebUI - installation aborted"
+        return 1
+    }
+    
+    __install_opendiffusion || {
+        __print_err "Failed to install OpenDiffusion - installation aborted"
+        return 1
+    }
+    
+    __install_continue || {
+        __print_err "Failed to install Continue - installation aborted"
+        return 1
+    }
     
     # Select and install models
     __print_info "Selecting AI models based on system capabilities..."
@@ -2445,12 +2606,18 @@ cmd_install() {
     __print_info "Installing AI models..."
     __env_load
     if [ "$INSTALLED_ollama" = "yes" ]; then
-        __install_ollama_model "$DEFAULT_OLLAMA_MODEL" || __print_warn "Failed to install Ollama model"
+        __install_ollama_model "$DEFAULT_OLLAMA_MODEL" || {
+            __print_err "Failed to install Ollama model - installation aborted"
+            return 1
+        }
     fi
     
     # Setup cron jobs
     __print_info "Setting up scheduled tasks..."
-    __setup_cron || __print_warn "Failed to setup cron jobs"
+    __setup_cron || {
+        __print_err "Failed to setup cron jobs - installation aborted"
+        return 1
+    }
     
     __print_success "CasAInit installation complete!"
     
@@ -3038,6 +3205,9 @@ __models_install() {
 
 # Uninstall command implementation
 cmd_uninstall() {
+    # Disable automatic cleanup since we're doing it manually
+    CLEANUP_ON_ERROR=false
+    
     __print_info "Uninstalling CasAInit and all components..."
     
     # Check for confirmation unless --yes flag is set
