@@ -128,6 +128,10 @@ ICON_PACKAGE="📦"
 ICON_PROGRESS="⏳"
 ICON_DOWNLOAD="⬇️"
 ICON_INSTALL="🔧"
+ICON_DOCKER="🐳"
+ICON_SERVICE="⚙️"
+ICON_MODEL="🤖"
+ICON_CONFIG="📝"
 
 # Core printf functions
 __printf_reset_color() {
@@ -173,10 +177,10 @@ __printf_percent_color() {
     empty=$((width - filled))
     
     # Create progress bar
-    printf '\r%b[' "$COLOR_CYAN"
-    printf '%*s' "$filled" | tr ' ' '='
-    printf '%*s' "$empty" | tr ' ' '>'
-    printf '] %3d%% %s%b' "$percent" "$task" "$COLOR_RESET"
+    printf '\r%b[' "$COLOR_MAGENTA"
+    printf '%*s' "$filled" | tr ' ' '█'
+    printf '%*s' "$empty" | tr ' ' '░'
+    printf '] %b%3d%%%b %b%s%b' "$COLOR_CYAN" "$percent" "$COLOR_RESET" "$COLOR_BLUE" "$task" "$COLOR_RESET"
 }
 
 __printf_percent_nc() {
@@ -212,26 +216,23 @@ __monitor_progress() {
         docker_pull)
             # Monitor docker pull progress
             image="$1"
-            docker pull "$image" 2>&1 | while IFS= read -r line; do
-                case "$line" in
-                    *"Pulling from"*)
-                        __print_info "Pulling image: $image"
-                        ;;
-                    *"Downloading"*)
-                        # Extract percentage from Docker output
-                        if echo "$line" | grep -q '\[.*=.*>\.*\]'; then
-                            percent=$(echo "$line" | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p')
-                            if [ -n "$percent" ]; then
-                                __print_progress "$percent" "Downloading layers"
-                            fi
-                        fi
-                        ;;
-                    *"Download complete"*|*"Pull complete"*)
-                        __print_progress 100 "Download complete"
-                        __print_progress_done
-                        ;;
-                esac
-            done
+            
+            # Show spinner since Docker pull doesn't give good progress
+            __print_info "Pulling image: $image"
+            (
+                docker pull "$image" >/dev/null 2>&1
+            ) &
+            pull_pid=$!
+            
+            __show_spinner "Pulling Docker image" $pull_pid
+            
+            # Check if pull succeeded
+            wait $pull_pid
+            if [ $? -eq 0 ]; then
+                __print_success "Docker image pulled successfully"
+            else
+                return 1
+            fi
             ;;
             
         curl_download)
@@ -257,29 +258,24 @@ __monitor_progress() {
             ;;
             
         ollama_pull)
-            # Monitor ollama model pull
+            # Monitor ollama model pull with cleaner output
             model="$1"
-            ollama pull "$model" 2>&1 | while IFS= read -r line; do
-                case "$line" in
-                    *"pulling"*)
-                        # Extract percentage if available
-                        percent=$(echo "$line" | grep -o '[0-9]\+%' | sed 's/%//')
-                        if [ -n "$percent" ]; then
-                            __print_progress "$percent" "Pulling $model"
-                        else
-                            __print_info "$line"
-                        fi
-                        ;;
-                    *"success"*)
-                        __print_progress 100 "Model downloaded"
-                        __print_progress_done
-                        ;;
-                    *)
-                        # Show other messages as info
-                        [ -n "$line" ] && __print_info "$line"
-                        ;;
-                esac
-            done
+            
+            # Run ollama pull in background and show spinner
+            (
+                ollama pull "$model" >/dev/null 2>&1
+            ) &
+            pull_pid=$!
+            
+            __show_spinner "Pulling model $model" $pull_pid
+            
+            # Check if pull succeeded
+            wait $pull_pid
+            if [ $? -eq 0 ]; then
+                __print_success "Model pulled successfully: $model"
+            else
+                return 1
+            fi
             ;;
             
         apt_install)
@@ -508,7 +504,7 @@ __show_spinner() {
         i=0
         frame_count=${#spinner_frames}
         
-        printf '%b%s  %s ' "$COLOR_CYAN" "$ICON_PROGRESS" "$task"
+        printf '%b%s  %b%s%b ' "$COLOR_YELLOW" "$ICON_PROGRESS" "$COLOR_BLUE" "$task" "$COLOR_RESET"
         while kill -0 "$pid" 2>/dev/null; do
             # Get current frame
             frame=$(printf '%s' "$spinner_frames" | cut -c$((i+1)))
@@ -537,7 +533,7 @@ __show_spinner_custom() {
         done
         printf 'done\n'
     else
-        printf '%b%s  %s ' "$COLOR_CYAN" "$icon" "$task"
+        printf '%b%s  %b%s%b ' "$COLOR_MAGENTA" "$icon" "$COLOR_BLUE" "$task" "$COLOR_RESET"
         
         # Animated dots
         dots=""
@@ -548,11 +544,11 @@ __show_spinner_custom() {
                 "..")  dots="..."  ;;
                 "...") dots=""     ;;
             esac
-            printf '\r%b%s  %s%s   %b' "$COLOR_CYAN" "$icon" "$task" "$dots" "$COLOR_RESET"
+            printf '\r%b%s  %b%s%s%b   ' "$COLOR_MAGENTA" "$icon" "$COLOR_BLUE" "$task" "$dots" "$COLOR_RESET"
             sleep 0.3
         done
         
-        printf '\r%b%s  %s%b\n' "$COLOR_GREEN" "$ICON_SUCCESS" "$task" "$COLOR_RESET"
+        printf '\r%b%s  %b%s%b\n' "$COLOR_GREEN" "$ICON_SUCCESS" "$COLOR_BOLD$COLOR_GREEN" "$task" "$COLOR_RESET"
     fi
 }
 
@@ -602,7 +598,7 @@ __print_info() {
     if [ "$RAW_MODE" = "true" ]; then
         __printf_log_raw "$1"
     else
-        printf '%b%s  %s' "$COLOR_CYAN" "$ICON_INFO" "$1"
+        printf '%b%s  %s' "$COLOR_BLUE" "$ICON_INFO" "$1"
         __printf_newline_color
     fi
 }
@@ -1371,7 +1367,18 @@ __download_file() {
     __print_info "Downloading from: $url"
     
     if __command_exists curl; then
-        __monitor_progress curl_download "$url" "$dest" || return 1
+        # Start download in background and show spinner
+        (
+            curl -L -# "$url" -o "$dest" 2>&1
+        ) &
+        download_pid=$!
+        
+        # Show spinner while downloading
+        __show_spinner "Downloading" $download_pid
+        
+        # Check if download succeeded
+        wait $download_pid
+        return $?
     elif __command_exists wget; then
         wget -q -O "$dest" "$url" || return 1
     else
@@ -1417,7 +1424,7 @@ __extract_archive() {
 
 # Tool installation functions
 __install_ollama() {
-    __print_info "Installing Ollama..."
+    printf '%b%s  %bInstalling Ollama...%b\n' "$COLOR_MAGENTA" "$ICON_PACKAGE" "$COLOR_CYAN" "$COLOR_RESET"
     
     # Check if already installed
     if [ "$(__env_get INSTALLED_ollama)" = "yes" ] && __command_exists ollama; then
@@ -1508,9 +1515,9 @@ EOF
     
     # Enable and start service
     if __command_exists systemctl; then
-        systemctl --user daemon-reload
-        systemctl --user enable casainit-ollama.service
-        systemctl --user start casainit-ollama.service
+        systemctl --user daemon-reload >/dev/null 2>&1
+        systemctl --user enable --quiet casainit-ollama.service
+        systemctl --user start casainit-ollama.service >/dev/null 2>&1
     fi
 }
 
@@ -1802,10 +1809,10 @@ __select_default_models() {
     __env_set "DEFAULT_TTS_MODEL" "$tts_model"
     __env_set "DEFAULT_DIFFUSION_MODEL" "$diffusion_model"
     
-    __print_info "Selected models:"
-    __print_raw "  Ollama:    $ollama_model"
-    __print_raw "  TTS:       $tts_model"
-    __print_raw "  Diffusion: $diffusion_model"
+    printf '%b%s  %bSelected models:%b\n' "$COLOR_YELLOW" "$ICON_MODEL" "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET"
+    printf '  %b%-12s%b %b%s%b\n' "$COLOR_MAGENTA" "Ollama:" "$COLOR_RESET" "$COLOR_CYAN" "$ollama_model" "$COLOR_RESET"
+    printf '  %b%-12s%b %b%s%b\n' "$COLOR_MAGENTA" "TTS:" "$COLOR_RESET" "$COLOR_CYAN" "$tts_model" "$COLOR_RESET"
+    printf '  %b%-12s%b %b%s%b\n' "$COLOR_MAGENTA" "Diffusion:" "$COLOR_RESET" "$COLOR_CYAN" "$diffusion_model" "$COLOR_RESET"
 }
 
 __install_ollama_model() {
@@ -1833,7 +1840,7 @@ __install_ollama_model() {
 }
 
 __install_piper() {
-    __print_info "Installing Piper TTS..."
+    printf '%b%s  %bInstalling Piper TTS...%b\n' "$COLOR_MAGENTA" "$ICON_PACKAGE" "$COLOR_CYAN" "$COLOR_RESET"
     
     # Check if already installed
     if [ "$(__env_get INSTALLED_piper)" = "yes" ] && __command_exists piper; then
@@ -1913,7 +1920,7 @@ __get_piper_version() {
 }
 
 __install_openwebui() {
-    __print_info "Installing OpenWebUI..."
+    printf '%b%s  %bInstalling OpenWebUI...%b\n' "$COLOR_BLUE" "$ICON_DOCKER" "$COLOR_CYAN" "$COLOR_RESET"
     
     # Check if already installed
     if [ "$(__env_get INSTALLED_openwebui)" = "yes" ]; then
@@ -1983,7 +1990,7 @@ __install_openwebui() {
 }
 
 __install_opendiffusion() {
-    __print_info "Installing OpenDiffusion..."
+    printf '%b%s  %bInstalling OpenDiffusion...%b\n' "$COLOR_BLUE" "$ICON_DOCKER" "$COLOR_CYAN" "$COLOR_RESET"
     
     # Check if already installed
     if [ "$(__env_get INSTALLED_opendiffusion)" = "yes" ]; then
@@ -2062,7 +2069,7 @@ __install_opendiffusion() {
 }
 
 __install_continue() {
-    __print_info "Installing Continue VS Code extension..."
+    printf '%b%s  %bInstalling Continue VS Code extension...%b\n' "$COLOR_MAGENTA" "$ICON_CONFIG" "$COLOR_CYAN" "$COLOR_RESET"
     
     # Check if VS Code is installed
     if ! __command_exists code; then
@@ -2078,11 +2085,13 @@ __install_continue() {
         return 0
     fi
     
-    # Install the extension in headless mode to prevent VS Code from opening
-    __print_info "Installing Continue extension..."
-    # Set DISPLAY to empty to force headless mode
-    if ! DISPLAY= code --install-extension continue.continue --force >/dev/null 2>&1; then
+    # Install the extension without opening VS Code window
+    printf '%b%s  %bInstalling Continue extension...%b\n' "$COLOR_MAGENTA" "$ICON_CONFIG" "$COLOR_CYAN" "$COLOR_RESET"
+    
+    # Simple install command
+    if ! code --install-extension continue.continue --force >/dev/null; then
         __print_err "Failed to install Continue extension"
+        __print_info "You can install it manually in VS Code: search for 'continue.continue'"
         return 1
     fi
     
@@ -2098,8 +2107,20 @@ __install_continue() {
             __print_info "Creating Continue configuration..."
             __ensure_dir "$HOME/.continue"
             
-            # Get Ollama port
+            # Get Ollama port and installed model
             ollama_port=$(__env_get "PORT_ollama" "11434")
+            ollama_model=$(__env_get "DEFAULT_OLLAMA_MODEL" "llama2:7b")
+            
+            # For autocomplete, use a smaller model if available
+            autocomplete_model="$ollama_model"
+            case "$ollama_model" in
+                codellama:13b)
+                    autocomplete_model="codellama:7b-code"
+                    ;;
+                mistral:7b|llama2:7b)
+                    autocomplete_model="$ollama_model"
+                    ;;
+            esac
             
             cat > "$config_file" << EOF
 {
@@ -2107,14 +2128,14 @@ __install_continue() {
     {
       "title": "Ollama",
       "provider": "ollama",
-      "model": "codellama:13b",
+      "model": "$ollama_model",
       "apiBase": "http://localhost:$ollama_port"
     }
   ],
   "tabAutocompleteModel": {
     "title": "Ollama Autocomplete",
     "provider": "ollama",
-    "model": "codellama:7b-code",
+    "model": "$autocomplete_model",
     "apiBase": "http://localhost:$ollama_port"
   }
 }
@@ -2550,7 +2571,7 @@ cmd_install() {
     }
     
     # Create required directories
-    __print_info "Creating directory structure..."
+    printf '%b%s  %bCreating directory structure...%b\n' "$COLOR_BLUE" "$ICON_CONFIG" "$COLOR_CYAN" "$COLOR_RESET"
     __ensure_dir "$MODELS_DIR/ollama" || return 1
     __ensure_dir "$MODELS_DIR/tts" || return 1
     __ensure_dir "$MODELS_DIR/diffusion" || return 1
@@ -2562,7 +2583,7 @@ cmd_install() {
     __set_permissions "$MODELS_DIR/diffusion" 777 || return 1
     
     # Install individual tools - fail on any error
-    __print_info "Installing AI tools..."
+    printf '%b%s  %bInstalling AI tools...%b\n' "$COLOR_YELLOW" "$ICON_MODEL" "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET"
     
     __install_ollama || {
         __print_err "Failed to install Ollama - installation aborted"
@@ -2589,24 +2610,33 @@ cmd_install() {
         return 1
     }
     
-    __install_continue || {
-        __print_err "Failed to install Continue - installation aborted"
-        return 1
-    }
-    
     # Select and install models
     __print_info "Selecting AI models based on system capabilities..."
     __select_default_models
     
     # Install default models
-    __print_info "Installing AI models..."
+    printf '%b%s  %bInstalling AI models...%b\n' "$COLOR_YELLOW" "$ICON_MODEL" "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET"
     __env_load
     if [ "$INSTALLED_ollama" = "yes" ]; then
         __install_ollama_model "$DEFAULT_OLLAMA_MODEL" || {
             __print_err "Failed to install Ollama model - installation aborted"
             return 1
         }
+        
+        # Install autocomplete model if it's different (for codellama users)
+        if [ "$DEFAULT_OLLAMA_MODEL" = "codellama:13b" ]; then
+            __print_info "Installing autocomplete model for better VS Code integration..."
+            __install_ollama_model "codellama:7b-code" || {
+                __print_warn "Failed to install autocomplete model, will use main model"
+            }
+        fi
     fi
+    
+    # Install Continue extension after core services are ready
+    __install_continue || {
+        __print_err "Failed to install Continue - installation aborted"
+        return 1
+    }
     
     # Setup cron jobs
     __print_info "Setting up scheduled tasks..."
@@ -2666,20 +2696,25 @@ cmd_status() {
         __env_load
         
         __printf_color_line "$COLOR_BOLD" "Installed Tools:"
+        tool_count=0
         if [ "$RAW_MODE" = "true" ]; then
-            [ "$INSTALLED_ollama" = "yes" ] && __print_raw "  * Ollama"
-            [ "$INSTALLED_opencode" = "yes" ] && __print_raw "  * OpenCode"
-            [ "$INSTALLED_piper" = "yes" ] && __print_raw "  * Piper"
-            [ "$INSTALLED_openwebui" = "yes" ] && __print_raw "  * OpenWebUI"
-            [ "$INSTALLED_opendiffusion" = "yes" ] && __print_raw "  * OpenDiffusion"
-            [ "$INSTALLED_continue" = "yes" ] && __print_raw "  * Continue"
+            [ "$(__env_get INSTALLED_ollama)" = "yes" ] && { __print_raw "  * Ollama"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_opencode)" = "yes" ] && { __print_raw "  * OpenCode"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_piper)" = "yes" ] && { __print_raw "  * Piper"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_openwebui)" = "yes" ] && { __print_raw "  * OpenWebUI"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_opendiffusion)" = "yes" ] && { __print_raw "  * OpenDiffusion"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_continue)" = "yes" ] && { __print_raw "  * Continue"; tool_count=$((tool_count+1)); }
         else
-            [ "$INSTALLED_ollama" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Ollama"
-            [ "$INSTALLED_opencode" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenCode"
-            [ "$INSTALLED_piper" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Piper"
-            [ "$INSTALLED_openwebui" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenWebUI"
-            [ "$INSTALLED_opendiffusion" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ OpenDiffusion"
-            [ "$INSTALLED_continue" = "yes" ] && __printf_color_line "$COLOR_GREEN" "  ✓ Continue"
+            [ "$(__env_get INSTALLED_ollama)" = "yes" ] && { printf '  %b✓ Ollama%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_opencode)" = "yes" ] && { printf '  %b✓ OpenCode%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_piper)" = "yes" ] && { printf '  %b✓ Piper%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_openwebui)" = "yes" ] && { printf '  %b✓ OpenWebUI%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_opendiffusion)" = "yes" ] && { printf '  %b✓ OpenDiffusion%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+            [ "$(__env_get INSTALLED_continue)" = "yes" ] && { printf '  %b✓ Continue%b\n' "$COLOR_GREEN" "$COLOR_RESET"; tool_count=$((tool_count+1)); }
+        fi
+        
+        if [ "$tool_count" -eq 0 ]; then
+            __print_info "  No tools installed yet"
         fi
     else
         __print_warn "No installation found"
@@ -2762,7 +2797,7 @@ __service_start_binary() {
             __print_info "$service is already running"
         else
             __print_info "Starting $service..."
-            systemctl --user start "casainit-$service" || {
+            systemctl --user start "casainit-$service" >/dev/null 2>&1 || {
                 __print_err "Failed to start $service"
                 return 1
             }
@@ -3463,7 +3498,7 @@ cmd_fix() {
     
     # Reload systemd
     if __command_exists systemctl; then
-        systemctl --user daemon-reload
+        systemctl --user daemon-reload >/dev/null 2>&1
     fi
     
     # Fix docker group membership
